@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    name: 语法检查 / 引擎自检（Python ${{ matrix.python }}）
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [ '3.9', '3.11', '3.12' ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 编译全部源码（语法检查）
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path src -Recurse -Filter *.py
+          Write-Host "检查 $($files.Count) 个文件"
+          foreach ($f in $files) {
+            python -m py_compile $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "语法错误: $($f.FullName)" }
+          }
+          Write-Host "OK"
+
+      - name: 引擎导入与常量自检
+        shell: pwsh
+        run: |
+          python -c @"
+import sys; sys.path.insert(0, 'src')
+import idm_engine as e
+assert hasattr(e, 'ALL_FINDERS'), 'ALL_FINDERS 缺失'
+assert hasattr(e, 'HELPER_FINDERS'), 'HELPER_FINDERS 缺失'
+assert hasattr(e, 'build_all_sites'), 'build_all_sites 缺失'
+assert hasattr(e, 'apply_all'), 'apply_all 缺失'
+names = [n for _, n in e.ALL_FINDERS]
+print('finders =', len(e.ALL_FINDERS))
+for n in names: print('  -', n)
+# P12 必须不在启用列表里（已被实测否决）
+assert not any('P12' in n for n in names), 'P12 不应出现在 ALL_FINDERS 中'
+print('OK')
+"@
+
+      - name: 验证「零第三方依赖」约束
+        shell: pwsh
+        run: |
+          # 扫描非标准库 import（粗筛，白名单外的模块会失败）
+          $std = @(
+            'os','sys','re','json','time','shutil','struct','hashlib','argparse',
+            'subprocess','ctypes','tempfile','datetime','calendar','winreg','glob',
+            'pathlib','io','base64','zlib','binascii','itertools','collections',
+            'typing','traceback','platform','uuid','math','random','string','codecs',
+            'idm_engine','idm_util','ctypes.wintypes','ctypes.win32','win32api'
+          )
+          $bad = @()
+          Get-ChildItem -Path src -Recurse -Filter *.py | ForEach-Object {
+            Select-String -Path $_.FullName -Pattern '^\s*(?:import|from)\s+([A-Za-z_][\w.]*)' |
+              ForEach-Object {
+                $m = $_.Matches[0].Groups[1].Value.Split('.')[0]
+                if ($std -notcontains $m) { $bad += "$($_.Filename): $m" }
+              }
+          }
+          if ($bad.Count -gt 0) {
+            Write-Host "发现疑似第三方依赖:"; $bad | Sort-Object -Unique | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "OK: 仅使用标准库"
+
+  docs:
+    name: 文档链接检查
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查 README 内部链接是否存在
+        shell: pwsh
+        run: |
+          $readme = Get-Content README.md -Raw -Encoding UTF8
+          $links = [regex]::Matches($readme, '\]\((?!https?:|#)([^)#]+)') | ForEach-Object { $_.Groups[1].Value }
+          $missing = @()
+          foreach ($l in ($links | Sort-Object -Unique)) {
+            $p = $l -replace '/', '\'
+            if (-not (Test-Path $p)) { $missing += $l }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "README 中以下链接目标不存在:"; $missing | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "OK: $($links.Count) 个内部链接全部有效"
+
+      - name: 校验 release 校验和清单
+        shell: pwsh
+        run: |
+          if (-not (Test-Path release\SHA256SUMS.txt)) { throw 'release/SHA256SUMS.txt 缺失' }
+          Get-Content release\SHA256SUMS.txt | Where-Object { $_ -match '\S' } | ForEach-Object {
+            $hash, $name = $_ -split '\s+', 2
+            $name = $name.TrimStart('*')
+            if (-not (Test-Path $name)) { throw "文件缺失: $name" }
+            $actual = (Get-FileHash $name -Algorithm SHA256).Hash
+            if ($actual -ne $hash.ToUpper()) { throw "哈希不符: $name`n  期望 $hash`n  实际 $actual" }
+            Write-Host "OK  $name"
+          }

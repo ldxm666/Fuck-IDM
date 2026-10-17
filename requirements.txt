@@ -1,0 +1,12 @@
+# Fuck IDM —— 依赖清单
+#
+# 本项目**只使用 Python 标准库**（struct / hashlib / ctypes / winreg / subprocess …），
+# 因此本文件故意保持为空。这样做的目的是让「源码即全部」：
+# 你不需要 pip install 任何东西就能审计并运行全部代码。
+#
+# 唯一的例外是「打包成单文件 EXE」这一步，它需要 PyInstaller：
+#
+#     pip install pyinstaller
+#     .\src\scripts\build-exe.ps1
+#
+# 运行时不依赖 PyInstaller。

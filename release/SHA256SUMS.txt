@@ -1,0 +1,13 @@
+# Fuck IDM — 发布物校验和（SHA-256）
+#
+# 校验方法（PowerShell）:
+#   Get-Content release\SHA256SUMS.txt | Where-Object { $_ -match '^\w{64}\s' } | ForEach-Object {
+#     $h, $n = $_ -split '\s+', 2
+#     $actual = (Get-FileHash $n.Trim() -Algorithm SHA256).Hash
+#     if ($actual -ne $h) { "MISMATCH: $n" } else { "OK: $n" }
+#   }
+#
+# 校验方法（Linux / macOS）:
+#   cd <repo root> && sha256sum -c release/SHA256SUMS.txt
+
+205C9B22DD50F0DDA9AA8E0CEC355AD08BB4CCEE94BD37CE4C2E6410C439071C  release/IDM-Activator.exe

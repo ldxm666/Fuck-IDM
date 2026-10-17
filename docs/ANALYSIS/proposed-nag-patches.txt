@@ -1,0 +1,147 @@
+# proposed-nag-patches.txt
+# IDM 6.43 Build 8 — 「试用/付费弹窗」触发链（FUN_0047D2C0）补丁建议
+#
+# 目标：C:\Program Files (x86)\Internet Download Manager\IDMan.exe
+# 分析副本：work/idm-6.43b8/bin/IDMan.exe.orig
+# sha256  74F177C8A44A6FEB95A88E1D8B385BC2683B4B87E7EF8BFE333A058C436CC9B8
+# 地址换算：.text  file_off = 0x400   + (VA - 0x401000)
+#           .data  file_off = 0x377600 + (VA - 0x779000)
+# 本文件所有偏移的「原始字节」均已用脚本对 IDMan.exe.orig 二次校验（结果见文末校验记录）。
+# 未修改 C:\Program Files (x86)\Internet Download Manager\ 下任何文件。
+
+================================================================================
+## 结论：无需追加补丁
+================================================================================
+
+针对本弹窗（FUN_0047D2C0，"This is 30 day trial version of Internet Download
+Manager. Do you want to register your copy of IDM now?"），**当前 PATCHES 表中的两条
+补丁已经足够，不需要追加任何补丁。**
+
+理由（全部为静态证据，详见 patches/nag-analysis.md）：
+
+(1) 该弹窗在整个镜像中只有 **一个** 调用点。
+    4 字节值 0x0047D2C0 全镜像扫描只命中 1 处：VA 0x494143（即 0x494142 的
+    `push 0x47D2C0` 立即数），位于 FUN_0048F5D0 的 case 0x14D7（VA 0x494138）。
+    补丁② `trial_nag_neutralized` 已把 FUN_0047D2C0 入口改成
+    `jmp 0x47D2FD`（= 它自己的 `mov eax,1 ; ret`），所以**消费者侧已被彻底切断**。
+
+(2) 触发 case 0x14D7 的命令 0x14D7 在整个 .text 中作为立即数只有 **一个** 生产者。
+    值 0x14D7 全 .text 扫描只命中 1 处：VA 0x4878A4（即 0x4878A3 的
+    `push 0x14D7`），位于 FUN_00486990（CDownloaderDlg::OnTimer）的 case 0x2D。
+
+(3) case 0x2D 只在 `WM_TIMER(nIDEvent = 0x2D)` 时执行，而定时器 0x2D 只有一个建立点。
+    VA 0x49402D（FUN_0048F5D0 的 case 0x14D8）：
+    `push 0 ; push 0x15F90 ; push 0x2D ; mov ecx,esi ; call 0x423E90`
+    → `SetTimer(hwnd, 0x2D, 90000, NULL)`。
+    全镜像 100 个 SetTimer 调用点中，nIDEvent 立即数取值集合为
+    {1,2,3,4,5,0xC,0x14,0x16,0x19,0x1B,0x20,0x21,0x22,0x24,0x25,0x26,0x31}
+    ∪ {寄存器}，**没有任何一处用 0x2D**；7 处 `mov reg,0x2D` 也都不在 SetTimer 调用点
+    附近。⇒ 定时器 0x2D 只能由 case 0x14D8 建立。
+
+(4) 命令 0x14D8 在整个 .text 中作为立即数只有 **一个** 生产者，且该生产者被
+    `[0x779CDC]` 门控。
+    值 0x14D8 全 .text 扫描只命中 1 处：VA 0x5BD500（即 0x5BD4FF 的
+    `push 0x14D8`），位于 FUN_005BD440。
+    门控：
+        0x5BD4EA  cmp dword ptr [0x779CDC], 0     ; 83 3D DC 9C 77 00 00
+        0x5BD4F1  je  0x5BD510                    ; 74 1D
+    补丁① `registration_flag_init` 把 [0x779CDC]（.data 初始化器，文件偏移
+    0x3782DC）从 1 改成 0 ⇒ 0x5BD4F1 必然跳转 ⇒ 0x5BD4FF 永不执行。
+
+(5) 该标志**不可能被写回 1**。
+    对 VA 0x779CDC 的 4 字节模式 `DC 9C 77 00` 在 .text 中全量扫描共 45 处命中，
+    逐条回看前置操作码：只有 2 处是写指令（操作码均为 `C7 05`），且两条立即数都是
+    0x00000000：
+        0x00450DB0  mov dword ptr [0x779CDC], 0
+        0x00523A70  mov dword ptr [0x779CDC], 0   ; 注册成功路径，随后发 WM_COMMAND 0x139F
+    其余 43 处均为读。⇒ .text 中不存在能把 [0x779CDC] 置为非 0 的指令，补丁① 的效果
+    在进程整个生命周期内不可恢复。
+
+(6) 因此：生产者（0x5BD4FF）与消费者（0x494138 → FUN_0047D2C0）**两端同时被切断**，
+    且中间环节（SetTimer 0x2D / PostMessage 0x14D7）都已被证明只有一个入口。
+    再追加补丁属于纯冗余，只会增加补丁面与版本校验失败的风险。
+
+--------------------------------------------------------------------------------
+## 关于「正常启动/下载流程复现不出弹窗」的补充说明（不构成追加补丁的理由）
+--------------------------------------------------------------------------------
+即使**不打补丁①**，正常流程也很难复现该弹窗，这是设计上的稀疏触发：
+  a. FUN_005BD440 在 0x5BD4DC-0x5BD4E8 计算 `newDownloadID % 20 == 7` 才置 cl=1，
+     即只有 1/20 的下载编号会满足；
+  b. 0x49402F `push 0x15F90` = 90000 ms，弹窗至少在下载创建后 **90 秒**才可能出现；
+  c. case 0x2D 在 0x48786A-0x487873 优先走 0x13CA 分支：只要注册表值 "Therad" 可读
+     且 `< [0x779CE0]`（[0x779CE0] 在 0x44CC27-0x44CC36 被重算为 `Trial?30:15`，
+     初始 0x1E=30），就发 WM_COMMAND 0x13CA 而**不发** 0x14D7。
+  d. 全链依赖消息泵（PostMessageA + WM_TIMER），不是同步调用。
+
+================================================================================
+## 可选加固补丁（OPTIONAL — 默认不采用；采用前请 Lead 明确决定）
+================================================================================
+# 说明：以下 3 条均为「纵深防御」，在补丁①②已生效的前提下**功能上冗余**。
+# 仅在下列任一前提成立时才有意义：
+#   - 需要防住「[0x779CDC] 被运行期/外部模块改回非 0」的假设风险（静态证据不支持）；
+#   - 需要让「无定时器 / 无 PostMessage」在二进制层面也成立，便于审计取证。
+# 格式：名称 | 文件偏移(hex) | 原始字节 | 补丁字节 | 理由
+# 所有条目均满足 patch_idm.py 的 PATCHES 表结构（等长替换 + 原始字节精确匹配）。
+
+optA_disable_14d8_gate | 0x1BC8F1 | 74 1D | EB 1D | VA 0x5BD4F1。把 `je 0x5BD510` 改成无条件 `jmp 0x5BD510`（目标不变，0x5BD4F1+2+0x1D=0x5BD510），使 FUN_005BD440 在任何 [0x779CDC] 取值下都不发 WM_COMMAND 0x14D8。与补丁①效果重复，纯纵深。
+optB_disable_timer_2d  | 0x09342D | 6A 00 68 90 5F | E9 1A 00 00 00 | VA 0x49402D，FUN_0048F5D0 的 case 0x14D8 入口。改为 `jmp 0x49404C`（0x49402D+5+0x1A=0x49404C，即该 case 自己的 `mov eax,1`），跳过 `SetTimer(hwnd,0x2D,90000,NULL)` 与 `this+0x292=1`。被覆盖的 5 字节尾部 `01 00`（原 `push 0x15F90` 的剩余部分）与后续 0x494034 `6A 2D` 成为不可达死字节。
+optC_suppress_14d7    | 0x086C9F | 74 16 | EB 16 | VA 0x48789F，FUN_00486990 的 case 0x2D 内。把 `je 0x4878B7` 改成无条件 `jmp 0x4878B7`（目标不变，0x48789F+2+0x16=0x4878B7），使 `PostMessageA(hwnd, WM_COMMAND, 0x14D7, 0)`（VA 0x4878A1）永不执行。
+
+--------------------------------------------------------------------------------
+### 可选条目：可直接粘贴进 patch_idm.py 的 PATCHES 表
+--------------------------------------------------------------------------------
+    # ---- OPTIONAL hardening (redundant with registration_flag_init +
+    #      trial_nag_neutralized; adopt only on explicit decision) ----
+    # (
+    #     "optA_disable_14d8_gate",
+    #     0x1BC8F1,
+    #     bytes([0x74, 0x1D]),                            # je  0x5BD510
+    #     bytes([0xEB, 0x1D]),                            # jmp 0x5BD510
+    #     "VA 0x5BD4F1: FUN_005BD440 unconditionally skips PostMessageA(0x14D8)",
+    # ),
+    # (
+    #     "optB_disable_timer_2d",
+    #     0x09342D,
+    #     bytes([0x6A, 0x00, 0x68, 0x90, 0x5F]),          # push 0 ; push 0x15F90
+    #     bytes([0xE9, 0x1A, 0x00, 0x00, 0x00]),          # jmp 0x49404C
+    #     "VA 0x49402D (case cmd 0x14D8): never arm SetTimer(hwnd,0x2D,90000)",
+    # ),
+    # (
+    #     "optC_suppress_14d7",
+    #     0x086C9F,
+    #     bytes([0x74, 0x16]),                            # je  0x4878B7
+    #     bytes([0xEB, 0x16]),                            # jmp 0x4878B7
+    #     "VA 0x48789F (OnTimer case 0x2D): never PostMessageA(WM_COMMAND,0x14D7,0)",
+    # ),
+
+================================================================================
+## 已部署补丁的复核（本次分析再次逐字节校验，未改动）
+================================================================================
+registration_flag_init   | 0x3782DC | 01 00 00 00 | 00 00 00 00 | VA 0x779CDC (g_registered) 的 .data 初始化器。1=Trial，0=Registered/Full。原始字节校验 MATCH。
+trial_nag_neutralized    | 0x07C6C0 | A1 04 89 78 00 | E9 38 00 00 00 | VA 0x47D2C0 (FUN_0047D2C0) 入口。原 `mov eax,[0x788904]` 改为 `jmp 0x47D2FD`（0x47D2C0+5+0x38=0x47D2FD = 该函数自己的 `mov eax,1 ; ret`）。原始字节校验 MATCH。
+
+================================================================================
+## 校验记录（对 IDMan.exe.orig 的原始字节二次校验输出）
+================================================================================
+registration_flag_init      off=0x003782DC  VA=0x00779CDC  bytes=01 00 00 00   (.data 段：off = 0x377600 + (VA-0x779000))
+trial_nag_neutralized       off=0x0007C6C0  VA=0x0047D2C0  bytes=A1 04 89 78 00
+optA_disable_14d8_gate      off=0x001BC8F1  VA=0x005BD4F1  bytes=74 1D            EXPECT=74 1D           MATCH
+optB_disable_timer_2d       off=0x0009342D  VA=0x0049402D  bytes=6A 00 68 90 5F  EXPECT=6A 00 68 90 5F  MATCH
+optC_suppress_14d7          off=0x00086C9F  VA=0x0048789F  bytes=74 16            EXPECT=74 16           MATCH
+
+上下文原始字节（用于人工复核）：
+  0x5BD4EA (off 0x1BC8EA)  = 83 3D DC 9C 77 00 00            ; cmp dword ptr [0x779CDC], 0
+  0x5BD4F1 (off 0x1BC8F1)  = 74 1D                           ; je 0x5BD510
+  0x5BD4FF (off 0x1BC8FF)  = 68 D8 14 00 00                  ; push 0x14D8
+  0x49402D (off 0x09342D)  = 6A 00 68 90 5F 01 00 6A 2D 8B CE E8 53 FE F8 FF
+  0x49404C (off 0x09344C)  = B8 01 00 00 00 9B E9 9A 63 00 00 ; mov eax,1 ; wait ; jmp 0x49A3F1
+  0x48789F (off 0x086C9F)  = 74 16                           ; je 0x4878B7
+  0x4878A1 (off 0x086CA1)  = 6A 00 68 D7 14 00 00 68 11 01 00 00 8B 56 20 52 FF 15 C8 47 69 00
+  0x494138 (off 0x093538)  = 6A 00 6A 00 6A 00 6A 00 6A 00 68 C0 D2 47 00 E8 49 75 18 00 B8 01 00 00 00 9B
+  0x47D2FD (off 0x07C6FD)  = B8 01 00 00 00 C3                  ; mov eax,1 ; ret
+
+复现命令（只读）：
+  python -c "d=open(r'work/idm-6.43b8/bin/IDMan.exe.orig','rb').read(); print(d[0x1BC8F1:0x1BC8F3].hex(' '), d[0x9342D:0x93432].hex(' '), d[0x86C9F:0x86CA1].hex(' '))"
+
+---
+*本文件为静态分析产物，未运行 IDMan.exe，未修改安装目录任何文件。*

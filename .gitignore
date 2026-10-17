@@ -1,0 +1,55 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+
+# ── 构建产物 ──────────────────────────────────────────────────────────────
+src/dist/
+src/build/
+*.exe.bak
+*.bak-original
+*.p8bak
+*.15pt-backup
+*.20pt-backup
+*.21pt-backup
+*.23pt-backup
+
+# ── 逆向工程中间件（体积大，不入库）───────────────────────────────────────
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.rep
+ghidra-proj/
+*.pyc
+
+# ── 运行日志 / 证据 / 截图（本机产生）─────────────────────────────────────
+logs/
+*.log
+!docs/**/*.log
+shots/
+*.jsonl
+*.csv
+!docs/**/*.csv
+activator.log
+
+# ── 系统与编辑器 ──────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+.agent_work/
+.scratch/
