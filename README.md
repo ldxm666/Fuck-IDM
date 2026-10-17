@@ -42,7 +42,7 @@
 | --- | --- |
 | `release/IDM-Activator.exe` | **单文件一键工具**（PyInstaller 打包，x64，双击自动提权） |
 | `src/IDM-Activator.py` | 一键工具源码（层 A 注册状态 + 层 B 补丁 + 层 C 防回退 + 回滚） |
-| `src/idm_engine.py` | **核心引擎**：极简 PE 解析器 + 特征码定位器 + 补丁施加器（P1–P15） |
+| `src/idm_engine.py` | **核心引擎**：极简 PE 解析器 + 特征码定位器 + 补丁施加器（P1–P17） |
 | `src/IDM-Unlock.py` / `.cmd` | 早期单目标（仅 `IDMan.exe`）解锁器，保留作为最小可用参考实现 |
 | `src/scripts/` | 40+ 个辅助脚本：部署 / 校验 / 状态回检 / 防回退 / UIA 验证 / 逆向工具 |
 | `tools/probe-scripts/` | Frida 动态探针（弹窗、IO、注册表）、PE 资源探针、XOR 字符串扫描 |
@@ -95,6 +95,7 @@ IDM 6.43 的试用到期后，用户会遇到三类症状，而这三类症状�
 | 判定成立也不许弹窗 | **P6 / P7 / P8 / P10 / P11 / P14**：从产生端、广播线程、显示端、包装器四个层次封 |
 | 记账标记不许写 | **P9**：封死 `MData` 的唯一活写入点 |
 | 注册框不许弹 | **P13 / P15**：启动路径 + 下载路径两条 case 体全部置空 |
+| `IDM is corrupt` 不许弹 | **P16 / P17**：损坏判定标志**永不置位**（根治）+ 告警唯一显示出口短路（兜底）—— 不再依赖 Frida 拦截器治标 |
 | 补丁不许被更新打回 | **层 C**：`IDMan.exe` 设 `DENY Everyone (WD,DE)`，更新包**写不进去** |
 
 **防回退用「预防」（ACL 不可变），而不是「修补」（守护重打补丁）** —— 这就是不需要常驻进程的原因。
@@ -121,7 +122,7 @@ IDM 6.43 的试用到期后，用户会遇到三类症状，而这三类症状�
 
 | IDM 版本 | Build | 主程序文件版本 | 原始 `IDMan.exe` SHA-256 | 全补丁 SHA-256 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| **6.43** | **b15** | `vCOUFP = 643b15` | `279CEED9AAA646650716EE326C0D996BE4CE5DB4B252CF5B2747F4938A7CE737` | `eca4afdc292f2f5dcb711f06939a2aafdbc35dd46945693555aee74daa45db67`（24 点，6,201,712 B） | ✅ **当前基线**，实机装机 MATCH |
+| **6.43** | **b15** | `vCOUFP = 643b15` | `279CEED9AAA646650716EE326C0D996BE4CE5DB4B252CF5B2747F4938A7CE737` | `25670EF11A9812BCE77EA90898CE4E2C8BD8CA039D0E76AAC4ADCA06C5D00BC5`（**26 点**，6,201,712 B） | ✅ **当前基线**（P1–P17 全量；P16/P17 = corrupt 弹窗根治） |
 | **6.43** | **b8** | `6,43,8,2` | `74F177C8A44A6FEB95A88E1D8B385BC2683B4B87E7EF8BFE333A058C436CC9B8` | `527E8EDB30DD42038F1C985A135CEA6A7258E6FA9BEB6283E743F49B392BE552` | ✅ 已实测（P1–P3 最小集） |
 | 6.43 其它 build | — | — | — | — | ⚠️ **未实测**：特征码通常仍可命中，请先跑 `--scan` 看命中情况 |
 | 6.42 及更早 | — | — | — | — | ❌ 不保证（`P2` 的 `"%b/%d/%Y"` 与 `P4` 指令形状在旧版存在差异） |
@@ -136,7 +137,7 @@ b15 的 counterfeit 弹窗有**两条独立显示路径**，其中一条在**另
 | `IDMGrHlp.exe` | `B3B6281EA820EAE88192E50B30698CF4C3B8BC3D4376C978403BC9E18E5857C23` | `63197914f0b2c0f547c0ac572c85f5a1783cf7d228befddedb6bba78461351f4` | 519,992 B |
 
 > ⚠️ **P8 不在 `IDM-Activator.exe` 的打包范围内**（它是独立 CLI，见 `src/scripts/apply_p8_idmgrhlp.py`）。
-> 也就是说：一键工具负责 `IDMan.exe` 的 P1–P15；`IDMGrHlp.exe` 的弹窗静音需要单独施加一次。
+> 也就是说：一键工具负责 `IDMan.exe` 的 P1–P17；`IDMGrHlp.exe` 的弹窗静音需要单独施加一次。
 
 ### 4.3 运行环境
 
@@ -152,12 +153,12 @@ b15 的 counterfeit 弹窗有**两条独立显示路径**，其中一条在**另
 
 ```text
 release/IDM-Activator.exe
-  SHA-256  1711148A570C73934AD51D40A207BFB9F6E5F081C8F0F421B39B61106C35A80E
-  Size     8,526,972 bytes        (v1.0.1：防火墙 IP 段 + 关自动检查更新 + 更新包隔离，驱动保留)
+  SHA-256  BD9FA86EC7A06C166AB503DD0A60BD165C952795DC12F5AE1B46CCE854F7A8E6
+  Size     8,531,169 bytes        (v1.0.2：新增 P16/P17 —— IDM is corrupt 告警根治)
   PE       MZ / PE32+ (x64) / PyInstaller onefile / manifest 要求 UAC 提权
 ```
 
-> 历史产物：v1.0.1 第二轮 `DC7020E7…`（8,522,931 B）、初版 `DDF8EEA2…`（8,520,829 B）、
+> 历史产物：v1.0.1 末版 `1711148A…`（8,526,972 B）、v1.0.1 第二轮 `DC7020E7…`（8,522,931 B）、初版 `DDF8EEA2…`（8,520,829 B）、
 > v1.0.0 `205C9B22…`（8,513,859 B）。
 
 完整清单见 [`release/SHA256SUMS.txt`](release/SHA256SUMS.txt)。
@@ -280,7 +281,7 @@ print(idm_engine.apply_all(r"C:\...\IDMan.exe"))  # 施加（自动备份）
 │  └─ 写格式合法的 Serial/FName/LName/Email 到 HKLM 32 位视图              │
 │      ⚠️ 必须写 HKLM\SOFTWARE\WOW6432Node\…，只写 HKCU 完全无效           │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ 层 B · 二进制补丁（P1–P15，特征码定位）                                  │
+│ 层 B · 二进制补丁（P1–P17，特征码定位）                                  │
 │  ├─ P1  注册状态全局 .data 初值 1 → 0（0 = Full）                        │
 │  ├─ P2  到期显示 "%b/%d/%Y" → "%b/%d/9999"                               │
 │  ├─ P3  试用弹窗函数置空                                                 │
@@ -379,9 +380,11 @@ FUN_0047D2C0  (弹窗本体)
 | **P13** | `registration_dialog` | `IDMan.exe` | 启动路径注册框 case 体置空 | ✅ 启用 |
 | **P14** | `wrapper_shortcut_A/B` | `IDMan.exe` | `sub_474D20` 按 `uType==0x41030` 短路（**一处覆盖全部显示点**） | ✅ 启用 |
 | **P15** | `download_reg_dialog` | `IDMan.exe` | 下载路径注册框 case 体置空 | ✅ 启用 |
+| **P16** | `corrupt_flag_gate` | `IDMan.exe` | 「损坏」判定标志写者 5×NOP ⇒ **IDM 根本不认为自身损坏**（根治） | ✅ 启用 |
+| **P17** | `corrupt_alert_exit` | `IDMan.exe` | corrupt 告警唯一显示出口 `call`→`mov eax,1`（兜底，禁止清栈） | ✅ 启用 |
 | （可选） | `update_gate` | `IDMan.exe` | 解除「升级前必须先注册」限制（`--allow-update`） | ⚪ 默认关闭 |
 
-**合计：`IDMan.exe` 24 个补丁点（P1–P7 + P9–P11 + P13–P15）+ `IDMGrHlp.exe` 2 个点。**
+**合计：`IDMan.exe` 26 个补丁点（P1–P7 + P9–P11 + P13–P17）+ `IDMGrHlp.exe` 2 个点。**
 
 每个补丁点的锚点、内部实现、调用方分支验证、抗混淆特征，见
 [`docs/PATCHES.md`](docs/PATCHES.md)。
@@ -482,7 +485,7 @@ Fuck-IDM/
 │   └── SHA256SUMS.txt
 ├── src/
 │   ├── IDM-Activator.py            ← 一键工具源码（层 A/B/C + 回滚）
-│   ├── idm_engine.py               ← 核心引擎：PE 解析 + 特征码定位 + P1–P15
+│   ├── idm_engine.py               ← 核心引擎：PE 解析 + 特征码定位 + P1–P17
 │   ├── IDM-Unlock.py               ← 最小可用解锁器（P1–P3）
 │   ├── IDM-Unlock.cmd              ← 双击入口
 │   └── scripts/                    ← 40+ 辅助脚本
@@ -503,7 +506,7 @@ Fuck-IDM/
 │   └── verify/                     ← 端到端验证脚本（soak / 下载回归 / P19 验收）
 ├── docs/
 │   ├── ARCHITECTURE.md             ← 技术原理（三层架构、触发链、锚点）
-│   ├── PATCHES.md                  ← P1–P15 补丁清单与证据卡
+│   ├── PATCHES.md                  ← P1–P17 补丁清单与证据卡
 │   ├── COMPATIBILITY.md            ← 版本矩阵与校验和
 │   ├── USAGE.md                    ← 完整使用手册（含排障）
 │   ├── FAQ.md                      ← 常见问题

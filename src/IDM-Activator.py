@@ -22,7 +22,7 @@ IDM-Activator —— Internet Download Manager 6.43 一键激活（免守护 / �
 ================================================================================
   层 A  注册状态   : 清掉 counterfeit 残留（MData + 缓存的校验判决值），
                      写格式合法的注册信息（抑制「注册 IDM」对话框）。
-  层 B  二进制补丁 : P1..P6 共 10 个补丁点（由 idm_engine.apply_all 施加）。
+  层 B  二进制补丁 : P1..P17（原始 b15 上 26 个补丁点；由 idm_engine.apply_all 施加）。
                      P5 封死 4 处 tripwire 自杀出口，P6 静音 2 处 counterfeit 弹窗。
                      => 即使误入 counterfeit 分支，IDM 也无法 ExitProcess(0)。
   层 C  防回退     : (a) IDMan.exe 文件系统 ACL 不可变（DENY Everyone WD,DE）
@@ -1588,7 +1588,7 @@ def verify_patched(exe, quiet=False):
             pass
 
     if actual == expect:
-        return "ok", "补丁完整（10/10，已用备份自证：期望哈希 %s）" % expect[:16], expect
+        return "ok", "补丁完整（已用备份自证：期望哈希 %s）" % expect[:16], expect
     if actual in KNOWN_ORIGINALS:
         return "original", "这是未打补丁的原版", expect
     return "mismatch", ("补丁不完整或文件被改动过：实际 %s ≠ 期望 %s"
@@ -1644,7 +1644,7 @@ def do_activate(args, install_dir):
     kill_idm(allowed=sys_ok)
 
     # ---------------- [2/8] 二进制补丁 ----------------
-    say("[2/8] 施加二进制补丁 P1..P6（10 个补丁点）...")
+    say("[2/8] 施加二进制补丁 P1..P17 ...")
     try:
         st, detail, changed = eng.apply_all(exe)
     except Exception as exc:
@@ -1867,7 +1867,7 @@ def do_status(install_dir):
     vst, vdetail, vexpect = verify_patched(exe)
     patch_ok = (vst == "ok")
     if patch_ok:
-        say("二进制补丁   : 完整（10/10，已用备份自证）")
+        say("二进制补丁   : 完整（已用备份自证，P1..P17）")
     elif vst == "original":
         say("二进制补丁   : 未施加（这是已知原版）")
     elif vst == "no_backup":

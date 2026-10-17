@@ -26,6 +26,10 @@ IDM-Unlock.py —— Internet Download Manager 一键解锁（去试用/付费�
                              结构上到不了 9999；这里让界面显示 9999）
   P3  trial_nag_kill      : 【可选】把试用登记弹窗函数改成空操作（纵深防御）。
                             仅在能可靠验证函数形状时才应用。
+  P16 corrupt_flag_gate   : 「IDM is corrupt」告警**根治** —— 损坏判定标志的写者改成 5×NOP，
+                            让 IDM 根本不认为自身 exe 损坏（唯一读者就是弹窗 gate）。
+  P17 corrupt_alert_exit  : 兜底 —— 告警对话框的**唯一显示出口** `call` 改成 `mov eax,1`
+                            （等价「用户点了继续下载」；**禁止补清栈**）。
 
 用法示例
 --------
@@ -2037,7 +2041,187 @@ def find_download_registration_dialog(pe):
 
 
 # --------------------------------------------------------------------------- #
-# 统一入口：P1..P15 的构建与施加
+# P16 / P17 —— 「IDM is corrupt」告警**根治**（静态链路已闭合，全库唯一性逐环验证）
+#
+# 完整调用链（Lead 全 `.text` 线性扫描 882,311 条指令得出）：
+#
+#   WM_COMMAND id 0x151B                    ← 「宣告主程序损坏」命令（跳表 idx 106）
+#     └─ 0x49A440  b8 01 00 00 00    mov eax,1
+#        0x49A445  a3 a0 93 78 00    mov dword ptr [0x7893A0], eax   ★唯一写者
+#        0x49A44A  9b                wait
+#        0x49A44B  e9 c5 00 00 00    jmp 0x49A515                    （return 1）
+#
+#   0x49B9C8  83 3d a0 93 78 00 00   cmp dword ptr [0x7893A0], 0      ★唯一读者
+#   0x49B9CF  74 0d                  je  0x49B9DE   ; 标志=0 ⇒ 正常路径，永不弹
+#   0x49B9D1  e8 ca d2 00 00         call 0x4A8CA0  ★唯一显示出口
+#   0x49B9D6  85 c0 / 0f 84 ...      test eax,eax / je ...（是否点了「继续下载」）
+#
+#   sub_4A8CA0 = 告警对话框：0x4A8D03 `call 0x4A8960`（取 6 段文案）→ GlobalAlloc/
+#   GlobalLock 建 DLGTEMPLATE → 0x4A8F26 `DialogBoxIndirectParamW`（全库唯一调用点）。
+#
+# ★ 为什么弹出来的一定是 corrupt 文案：`sub_4A8960` 读 `word [0x788E54]`，该处
+#   `.data` 初值 = 0 ⇒ `movzx eax,[..]` = 0 ⇒ `dec eax` = 0xFFFFFFFF ⇒
+#   `cmp eax,0x29 / ja 0x4A8BE0` 成立 ⇒ **永远落到默认（corrupt）分支**。
+#   即这条告警**从来没设置过消息 ID**，所以每次都显示「主程序文件已损坏」。
+#
+# ★ 两个补丁**互相独立、各自扫锚点**（铁律⑪：绝不依赖另一个 finder 施加后的状态）：
+#   只共用「gate 锚点」这一串**不被任何补丁改动的字节**；P16 不看 P17 的字节，
+#   P17 也不看 P16 的字节。因此施加顺序、重复施加、只施加其一都成立。
+# --------------------------------------------------------------------------- #
+
+# 「损坏标志 gate」——P16/P17 共用的唯一锚点。
+# 全库 uniq=1；★ **不包含任何被两个补丁改动的字节**（P16 改 0x49A445、
+# P17 改 0x49B9D1，两者都不在这 9 字节内），因此施加前后都能定位。
+_CORRUPT_GATE_ANCHOR = b"\x83\x3d\xa0\x93\x78\x00\x00\x74\x0d"
+# P17 本版原始字节（`call 0x4A8CA0`）；仅用于 describe()/回滚说明，
+# 结构校验走「目标是否落在 .text 内」，避免锚点过严造成假阴性（铁律⑧）。
+_P17_CALL_OLD = b"\xe8\xca\xd2\x00\x00"
+
+
+def _find_corrupt_gate(pe, notes):
+    """定位「损坏标志 gate」：`cmp dword ptr [flag],0 ; je <正常路径>`。
+
+    返回 `(gate_file_off, flag_va)`；缺失/不唯一 ⇒ `(None, None)` 并写入 note。
+    这是 P16/P17 的**共同前提**：它给出标志 VA（P16 要靠它拼出写者形态），
+    且其自身字节不被两个补丁改动，故可同时作为「未施加 / 已施加」两态的锚。
+    """
+    d = bytes(pe.data)
+    t0, t1 = pe.text_span()
+    hits = []
+    p = d.find(_CORRUPT_GATE_ANCHOR, t0)
+    while 0 <= p < t1:
+        hits.append(p)
+        p = d.find(_CORRUPT_GATE_ANCHOR, p + 1)
+    if len(hits) != 1:
+        notes.append("[❌] mismatch：损坏标志 gate 锚点命中 %d 处（期望恰好 1）—— "
+                     "锚点未命中，拒绝施加（铁律⑫：不静默跳过）" % len(hits))
+        return None, None
+    gate = hits[0]
+    flag_va = struct.unpack_from("<I", d, gate + 2)[0]
+    notes.append("gate 锚点命中 1 处：VA 0x%08X，损坏标志 VA 0x%08X"
+                 % (pe.off_to_va(gate) or 0, flag_va))
+    return gate, flag_va
+
+
+def find_corrupt_flag_gate(pe):
+    """P16 —— 「损坏」判定标志**永不置位**（根治：IDM 根本不认为自身 exe 损坏）。
+
+    定位（内容锚定 + 结构校验，**不写死偏移**）：
+      1. 共用锚 = `83 3d a0 93 78 00 00 74 0d`（gate，全库 uniq=1）⇒ 读出标志 VA；
+      2. 写者形态 = `a3 <标志VA32>`（`mov dword ptr [flag], eax`），全库 uniq=1；
+      3. 结构校验（三条都必须成立，且**都不被本补丁改动**）：
+           写者前 5B == `b8 01 00 00 00`（`mov eax,1` —— 保留 ⇒ 该 case 仍返回 1）
+           写者后 1B == `9b`（`wait`）
+           写者后 2B == `e9`（`jmp rel32` —— 跳到 return 1 的收尾段）
+         比「直接搜 `a3 a0 93 78 00`」更稳：换版本后即使标志地址变了也能重定位。
+      4. **已施加形态** = 写者处 5×NOP，用**同一条结构链**认回（不需要写死偏移，
+         也不会因为「原始字节已消失」而误报锚点缺失）。
+      5. 候选不唯一 ⇒ 拒绝（不做猜测）。
+
+    清栈（铁律⑯）：`mov [mem],reg` 无 call、无栈操作 ⇒ 换 5×NOP 后栈完全不变；
+    前面的 `mov eax,1` 保留 ⇒ 该 case 仍返回「已处理」，调用方行为不变。
+    副作用：`[0x7893A0]` 全库唯一读者就是那道 gate ⇒ 置不置位**只影响弹不弹**。
+    """
+    notes, sites = [], []
+    d = bytes(pe.data)
+    t0, t1 = pe.text_span()
+    gate, flag_va = _find_corrupt_gate(pe, notes)
+    if gate is None:
+        return None, notes
+    writer = b"\xa3" + struct.pack("<I", flag_va)
+    nop5 = b"\x90" * 5
+    cands = []
+    p = d.find(b"\xb8\x01\x00\x00\x00", t0)
+    while 0 <= p < t1 - 12:
+        if d[p + 5:p + 10] in (writer, nop5) and d[p + 10] == 0x9B and d[p + 11] == 0xE9:
+            cands.append(p + 5)
+        p = d.find(b"\xb8\x01\x00\x00\x00", p + 1)
+    if len(cands) != 1:
+        notes.append("[❌] mismatch：`mov eax,1`+写者/NOP+`wait`+`jmp` 结构命中 %d 处"
+                     "（期望恰好 1）—— 锚点未命中，拒绝施加" % len(cands))
+        return None, notes
+    off = cands[0]
+    cur = bytes(d[off:off + 5])
+    applied = cur == nop5
+    if not applied and cur != writer:
+        notes.append("[❌] mismatch：写者位置字节不符（%s）—— 拒绝施加" % cur.hex(" "))
+        return None, notes
+    sites.append(Site(
+        "corrupt_flag_gate_%X" % off, "P16 corrupt 判定标志不置位（根治）",
+        off, writer, nop5, va=pe.off_to_va(off),
+        detail="写者 -> 5×NOP（`mov eax,1` 保留 ⇒ 该 case 仍返回「已处理」；"
+               "无栈操作、无需清栈；标志唯一读者是 gate ⇒ 只影响弹不弹）"))
+    notes.append("  [命中] VA 0x%08X：%s -> %s（%s）"
+                 % (pe.off_to_va(off) or 0, writer.hex(" "), nop5.hex(" "),
+                    "已在位" if applied else "本次施加"))
+    return sites, notes
+
+
+def find_corrupt_alert_exit(pe):
+    """P17 —— corrupt 告警**唯一显示出口**短路（兜底）。
+
+    定位（锚点相对 + 结构校验）：
+      1. 共用锚 = gate（全库 uniq=1）；锚尾（gate+9）**紧邻**就是显示出口的 call
+         —— 这不是写死的偏移，而是 `cmp … / je …` 之后必然紧跟被 gate 保护的分支体；
+      2. 出口必须是 `e8 <rel32>`，且 rel32 目标落在 `.text` 内（本版 = 0x4A8CA0，
+         即 `DialogBoxIndirectParamW` 唯一调用点所在的告警对话框函数）；
+      3. 紧随其后必须是 `85 c0`（`test eax,eax`）+ `0f 84`（`je rel32`）——
+         这两条说明返回值 = 「是否点了 Continue downloading」，且**不被本补丁改动**；
+      4. **已施加形态** = `b8 01 00 00 00`（`mov eax,1`，与 call 等长 5 字节）。
+
+    清栈（铁律⑯）：★ **禁止补清栈**。原 call 的目标 `sub_4A8CA0` 内部
+    `add esp,0x3c; ret` **自平栈**（调用方其后没有 `add esp`）；整条 call 被等长
+    `mov eax,1` 替换后**没有任何 push** ⇒ 不存在栈残留 ⇒ 若再补 `add esp` 反而
+    会**破坏调用方栈**（P10 同款结论）。
+    语义：等价于「用户点了 Continue downloading」⇒ `test eax,eax` 非零 ⇒
+    走 0x49B9DE 正常路径。价值：即使将来出现第二条写者，弹窗仍然不显示。
+    """
+    notes, sites = [], []
+    d = bytes(pe.data)
+    t0, t1 = pe.text_span()
+    gate, _flag_va = _find_corrupt_gate(pe, notes)
+    if gate is None:
+        return None, notes
+    off = gate + len(_CORRUPT_GATE_ANCHOR)      # 锚尾 = 显示出口 call（紧跟 je 之后）
+    cur = bytes(d[off:off + 5])
+    new = b"\xb8\x01\x00\x00\x00"
+    applied = cur == new
+    if applied:
+        old = _P17_CALL_OLD
+    else:
+        if cur[0:1] != b"\xe8":
+            notes.append("[❌] mismatch：gate 锚尾不是 `call rel32`（实际 %s）—— 拒绝施加"
+                         % cur.hex(" "))
+            return None, notes
+        rel = struct.unpack_from("<i", d, off + 1)[0]
+        tgt_va = (pe.off_to_va(off) or 0) + 5 + rel
+        tgt_off = pe.va_to_off(tgt_va)
+        if tgt_off is None or not (t0 <= tgt_off < t1):
+            notes.append("[❌] mismatch：call 目标 0x%08X 不在 .text 内 —— 拒绝施加" % tgt_va)
+            return None, notes
+        notes.append("显示出口 call 目标 VA 0x%08X（告警对话框，DialogBoxIndirectParamW 唯一调用点）"
+                     % tgt_va)
+        if cur != _P17_CALL_OLD:
+            notes.append("  （call rel32 与本版记录不同：%s vs %s，按结构校验继续）"
+                         % (cur.hex(" "), _P17_CALL_OLD.hex(" ")))
+        old = cur
+    if bytes(d[off + 5:off + 7]) != b"\x85\xc0" or bytes(d[off + 7:off + 9]) != b"\x0f\x84":
+        notes.append("[❌] mismatch：出口之后不是 `test eax,eax; je rel32`（实际 %s）—— 拒绝施加"
+                     % d[off + 5:off + 11].hex(" "))
+        return None, notes
+    sites.append(Site(
+        "corrupt_alert_exit_%X" % off, "P17 corrupt 告警显示出口短路（兜底）",
+        off, old, new, va=pe.off_to_va(off),
+        detail="call 对话框 -> mov eax,1（等价「点了继续下载」⇒ 走正常路径；"
+               "call 已整条替换、无 push ⇒ 禁止补清栈）"))
+    notes.append("  [命中] VA 0x%08X：%s -> %s（%s）"
+                 % (pe.off_to_va(off) or 0, old.hex(" "), new.hex(" "),
+                    "已在位" if applied else "本次施加"))
+    return sites, notes
+
+
+# --------------------------------------------------------------------------- #
+# 统一入口：P1..P17 的构建与施加
 #
 # 放在 engine 里（而不是 activator 里）是为了让「部署/验证」与「用户流程」两条
 # 工作流共用同一份实现，避免两处各写一套 apply 逻辑而漂移。
@@ -2059,6 +2243,10 @@ ALL_FINDERS = (
     # 由 build_all_sites 的「按偏移去重、先到先得」把重复项收敛掉。
     (find_wrapper_utype_shortcut, "P14 弹窗包装按 uType 短路（wrapper 级，cave）"),
     (find_download_registration_dialog, "P15 下载路径注册框不创建"),
+    # P16/P17 放在最后：两者各自独立扫 gate 锚点（铁律⑪），不依赖任何前面 finder
+    # 的施加后状态，也不与任何既有站点共用偏移。
+    (find_corrupt_flag_gate, "P16 corrupt 判定标志不置位（根治）"),
+    (find_corrupt_alert_exit, "P17 corrupt 告警显示出口短路（兜底）"),
     # ⚠️ P12（find_license_valid，file 0xEDBF7 / 0xEDC1F，A+B）**已被实测否决**：
     #    Lead 手工热补丁 + 冷启动验证 ⇒ 注册框照旧弹 12/12。原因是它改的
     #    `byte_788CF4` 根本不是「决定弹注册框」的标志（注册框的门控在
