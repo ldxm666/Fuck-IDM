@@ -193,8 +193,6 @@ sc start idmwfp
 | `idmupdt.exe` | 已隔离 |
 | 弹窗 | GONE |
 
----
-
 ## [1.0.0] - 2026-10-17
 
 首个开源版本。基线：IDM **6.43 Build 15**，24 点全量补丁（`eca4afdc…`），实机装机 MATCH。
@@ -247,3 +245,57 @@ sc start idmwfp
 | --- | --- | --- |
 | b8 方案 | 2026-08 | IDM 6.43 Build 8：P1–P3，`g_registered @ 0x779CDC`，实测 Full + 9999 |
 | b15 方案 | 2026-10 | IDM 6.43 Build 15：根因确认（counterfeit 自伤闭环），P1–P15 全量 24 点 |
+
+### 追加修复（同日第四轮：**驱动必须保留 —— 浏览器集成是核心**）
+
+用户明确：**高级浏览器集成必须有，这是最核心的功能**。
+所以「停驱动」方向**撤回** —— 改成**绕开它而不是关掉它**。
+
+**两个弹窗其实是同一件事的两面**
+
+| 弹窗 | 触发 | 文案来源 |
+| --- | --- | --- |
+| `IDM is corrupt` | 后台挂几小时 | `The main IDM executive file is damaged…`（`.data` @ `0x37C5CC`，XOR `0x3D`） |
+| **`需要修复这个文件吗`** | **点/周期「检查更新」** | `template.lng` **20955**：`IDM cannot check for updates because an important system file is damaged on your computer. Repair this file?` |
+
+两者都源于 **IDM 的「完整性自检 + 自动修复」逻辑**：
+
+1. 周期/手动触发检查更新
+2. 先读 `hosts`（看有没有自己的域名被屏蔽）、再看自身文件
+3. 判定「重要系统文件损坏」→ 弹框
+4. 点「继续」→ **去把 hosts 屏蔽行注释掉**（实测 3 秒内完成）
+
+**所以 hosts 屏蔽和"修复"弹窗天生打架** —— 屏蔽越狠，弹得越勤。
+
+**最终定案：不写 hosts 屏蔽 + 关自动检查更新 + 防火墙挡 IP + 驱动保留**
+
+| 层 | 做法 | 为什么 |
+| --- | --- | --- |
+| hosts | **默认不写屏蔽**（`--with-hosts` 才写） | 没有屏蔽行 → IDM 没有可"修复"的东西 |
+| 自动检查更新 | **关闭**：`CheckUpdtVM 10→3650`、`LastCheckQU→2145916800`（2038） | 不检查 → 不触发自检 |
+| 防火墙 | `67.18.0.0/16` + `67.18.60.0/24` + `67.18.140.0/24` + **`169.62.35.0/24`** | 挡网络且不影响正常下载 |
+| **驱动 idmwfp** | **保留 RUNNING**（`--no-browser-integration` 才停） | **它就是高级浏览器集成的核心** |
+| 更新包 | `idmupdt.exe` 隔离 | 去掉一路校验输入 |
+
+**新发现的服务器 IP（之前被 hosts 挡住看不到）**
+
+```
+internetdownloadmanager.com        -> 67.18.60.145
+register./update./support.…        -> 67.18.140.140
+tonec.com / www.tonec.com          -> 169.62.35.21   ← 新，之前从没挡过
+```
+
+**实测最终状态**
+
+```
+hosts        28 行原始内容，mtime 恒定不变
+idmwfp       STATE=RUNNING（高级浏览器集成可用）
+自动检查更新  off（CheckUpdtVM=3650 LastCheckQU=2145916800）
+防火墙        4 个网段 Block
+弹窗          IDM is corrupt: GONE / 需要修复: GONE
+IDM 主窗口    正常
+```
+
+---
+
+## [1.0.0] - 2026-10-17

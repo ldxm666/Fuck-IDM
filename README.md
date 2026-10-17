@@ -152,8 +152,8 @@ b15 的 counterfeit 弹窗有**两条独立显示路径**，其中一条在**另
 
 ```text
 release/IDM-Activator.exe
-  SHA-256  387B3296177BDE1467BFB05DBDCB7305DB0B185F704B9805F605667093D36C50
-  Size     8,525,563 bytes        (v1.0.1：防火墙 + hosts ACL + 更新包隔离 + 内核特权移除)
+  SHA-256  1711148A570C73934AD51D40A207BFB9F6E5F081C8F0F421B39B61106C35A80E
+  Size     8,526,972 bytes        (v1.0.1：防火墙 IP 段 + 关自动检查更新 + 更新包隔离，驱动保留)
   PE       MZ / PE32+ (x64) / PyInstaller onefile / manifest 要求 UAC 提权
 ```
 

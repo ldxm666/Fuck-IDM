@@ -1154,6 +1154,83 @@ def restore_wfp_driver(install_dir=None, quiet=False):
 
 
 # --------------------------------------------------------------------------- #
+# 层 C 第六层：关掉 IDM 的「自动检查更新」（避免"需要修复这个文件吗"弹窗）
+#
+# ★ 为什么必须关：
+#   IDM 的自动检查更新会先看 hosts / 校验自身文件，判定「重要系统文件损坏」后弹：
+#     "由于一个重要的系统文件出现问题，IDM 无法检查更新。您需要修复这个文件吗？"
+#     （template.lng 20955：IDM cannot check for updates because an important
+#       system file is damaged on your computer. Repair this file?）
+#   点「继续」它就会去"修复"——实测就是把你 hosts 里的屏蔽行**注释掉**。
+#   ⇒ 只要它还在周期检查，hosts 屏蔽和"修复"弹窗就永远打架。
+#
+# ★ 做法（纯注册表，零副作用、可回滚）：
+#   CheckUpdtVM  10 -> 3650        （检查间隔，天）
+#   LastCheckQU  -> 2145916800     （2038-01-01，让 IDM 认为"刚检查过"）
+#   updtTime     -> 2145916800
+# --------------------------------------------------------------------------- #
+DM_KEY = r"Software\DownloadManager"
+IDM_HKLM_KEY = r"SOFTWARE\WOW6432Node\Internet Download Manager"
+AUTOUPDATE_DAYS = 3650
+FUTURE_TS = 2145916800          # 2038-01-01 00:00:00 UTC
+
+
+def _reg_get(root, sub, name):
+    try:
+        import winreg
+        with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except Exception:
+        return None
+
+
+def _reg_set(root, sub, name, value, typ):
+    try:
+        import winreg
+        with winreg.OpenKey(root, sub, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, name, 0, typ, value)
+        return True
+    except Exception as exc:
+        log("  [警告] 写注册表 %s\\%s 失败：%s" % (sub, name, exc))
+        return False
+
+
+def auto_update_state():
+    """返回 (state, detail)。state ∈ {"off", "on"}。"""
+    import winreg
+    days = _reg_get(winreg.HKEY_CURRENT_USER, DM_KEY, "CheckUpdtVM")
+    last = _reg_get(winreg.HKEY_CURRENT_USER, DM_KEY, "LastCheckQU")
+    off = (isinstance(days, int) and days >= AUTOUPDATE_DAYS) and \
+          (isinstance(last, int) and last >= FUTURE_TS)
+    detail = "CheckUpdtVM=%s LastCheckQU=%s" % (days, last)
+    return ("off" if off else "on"), detail
+
+
+def disable_auto_update_check(quiet=False):
+    """把自动检查更新推到 10 年后（幂等）。返回 (ok, 说明)。"""
+    import winreg
+    ok1 = _reg_set(winreg.HKEY_CURRENT_USER, DM_KEY, "CheckUpdtVM", AUTOUPDATE_DAYS, winreg.REG_DWORD)
+    ok2 = _reg_set(winreg.HKEY_CURRENT_USER, DM_KEY, "LastCheckQU", FUTURE_TS, winreg.REG_DWORD)
+    _reg_set(winreg.HKEY_CURRENT_USER, DM_KEY, "LstCheck", "01/01/38", winreg.REG_SZ)
+    _reg_set(winreg.HKEY_LOCAL_MACHINE, IDM_HKLM_KEY, "updtTime", FUTURE_TS, winreg.REG_DWORD)
+    st, det = auto_update_state()
+    if not quiet:
+        log("  自动检查更新：已关闭（%s）" % det)
+        log("  → 不会再弹「IDM 无法检查更新 / 需要修复这个文件吗」")
+    return (st == "off"), det
+
+
+def restore_auto_update_check(quiet=False):
+    """恢复自动检查更新（幂等）。"""
+    import winreg
+    _reg_set(winreg.HKEY_CURRENT_USER, DM_KEY, "CheckUpdtVM", 10, winreg.REG_DWORD)
+    _reg_set(winreg.HKEY_CURRENT_USER, DM_KEY, "LastCheckQU", 0, winreg.REG_DWORD)
+    if not quiet:
+        log("  自动检查更新：已恢复（CheckUpdtVM=10）")
+    return True, "已恢复"
+
+
+# --------------------------------------------------------------------------- #
 # 文件不可变（DENY ACE）—— 替代守护的关键一步
 # --------------------------------------------------------------------------- #
 
@@ -1631,19 +1708,23 @@ def do_activate(args, install_dir):
     else:
         say("  已跳过（隔离护栏：不写实机 HKLM/HKCU）")
 
-    # ---------------- [5/8] hosts 屏蔽 ----------------
-    say("[5/8] 屏蔽注册/校验域名（hosts，域名级抗 IP 漂移）...")
-    hok, hmsg = False, "已跳过（隔离护栏：不碰实机 hosts）"
-    if sys_ok:
-        hok, hmsg = apply_hosts()
-        if not hok:
-            say("  !! %s" % hmsg)
+    # ---------------- [5/8] hosts 屏蔽（默认跳过）----------------
+    # ⚠️ 2026-10-17 实测定案：**默认不写 hosts 屏蔽**。
+    #   原因：IDM 的自动检查更新会读 hosts，判定「重要系统文件损坏」后弹
+    #   「由于一个重要的系统文件出现问题，IDM 无法检查更新。您需要修复这个文件吗？」
+    #   点「继续」它就去把屏蔽行注释掉 —— 屏蔽和"修复"弹窗永远打架。
+    #   网络层改由**防火墙 IP 段**兜（IDM 改不了防火墙），见 [5.5/8]。
+    #   需要 hosts 屏蔽的旧场景：加 `--with-hosts`。
+    say("[5/8] hosts 屏蔽 ... 默认跳过（会触发 IDM 的「需要修复这个文件吗」弹窗）")
+    if getattr(args, "with_hosts", False):
+        hok, hmsg = False, "已跳过（隔离护栏：不碰实机 hosts）"
+        if sys_ok:
+            hok, hmsg = apply_hosts()
+            say("  %s %s" % ("OK  " if hok else "!!  ", hmsg))
         else:
             say("  %s" % hmsg)
-            say("  备份   : %s" % HOSTS_BACKUP)
-            say("  DNS    : 已刷新（不刷缓存的话 hosts 可能不生效）")
     else:
-        say("  %s" % hmsg)
+        say("  已跳过。网络层由防火墙 IP 段负责（[5.5/8]），不需要 hosts。")
 
     # ---------------- [5.5/8] 防火墙出站阻断 ----------------
     # hosts 只挡浏览器，挡不住 IDMan.exe 自己（官方 .lng 里自己承认了这一点）。
@@ -1666,13 +1747,29 @@ def do_activate(args, install_dir):
     else:
         say("  已跳过（隔离护栏）")
 
-    # ---------------- [5.7/8] 停用 idmwfp 内核文件系统驱动 ----------------
-    # ★ 这是 hosts 被反复拆掉的**真正元凶**：idmwfp 是 TYPE=2 文件系统驱动，
-    #   挂在文件系统栈上，ACL(DENY) 对它完全无效。停用后 hosts 才真的保得住。
-    say("[5.7/8] 停用 IDM 内核文件系统驱动 idmwfp（改 hosts 的元凶）...")
+    # ---------------- [5.7/8] idmwfp 驱动（默认**保留**）----------------
+    # ⚠️ 2026-10-17 定案：**默认不停驱动**。
+    #   因为 idmwfp 正是「高级浏览器集成」的核心 —— 停了它，浏览器里点下载就不接管了。
+    #   而它改 hosts 的行为，已经用「不写 hosts 屏蔽 + 关自动检查更新」绕开了
+    #   （没有屏蔽行 → 它没有可"修复"的东西）。
+    #   确实要停：加 `--no-browser-integration`。
+    say("[5.7/8] IDM 内核驱动 idmwfp ... 默认保留（= 高级浏览器集成，核心功能）")
+    if getattr(args, "no_browser_integration", False):
+        if sys_ok:
+            wok, wmsg = disable_wfp_driver(install_dir)
+            say("  %s %s" % ("OK  " if wok else "!!  ", wmsg))
+        else:
+            say("  已跳过（隔离护栏）")
+    else:
+        _wst, _wdet = wfp_driver_state()
+        say("  保留：%s（%s）—— 浏览器集成可用" % (_wst, _wdet))
+
+    # ---------------- [5.8/8] 关闭自动检查更新 ----------------
+    # 这是「需要修复这个文件吗」弹窗的直接来源：它周期检查 → 判定系统文件损坏 → 弹框。
+    say("[5.8/8] 关闭 IDM 自动检查更新（避免「需要修复这个文件吗」弹窗）...")
     if sys_ok:
-        wok, wmsg = disable_wfp_driver(install_dir)
-        say("  %s %s" % ("OK  " if wok else "!!  ", wmsg))
+        aok, amsg = disable_auto_update_check()
+        say("  %s %s" % ("OK  " if aok else "!!  ", amsg))
     else:
         say("  已跳过（隔离护栏）")
 
@@ -1854,8 +1951,13 @@ def do_status(install_dir):
     _wst, _wdet = wfp_driver_state()
     say("内核驱动     : %s（%s）%s" % (
         _wst, _wdet,
-        "  <== 已停用，hosts 不会被 IDM 拆掉" if _wst in ("disabled", "stopped", "absent")
-        else "  <== 仍在运行！它会绕过 ACL 改 hosts，建议跑 --activate"))
+        "  <== 保留（高级浏览器集成可用）" if _wst == "running"
+        else "  <== 已停用（浏览器集成不可用；跑 --activate 可恢复）"))
+    _ast, _adet = auto_update_state()
+    say("自动检查更新 : %s（%s）%s" % (
+        _ast, _adet,
+        "  <== 已关闭，不会弹「需要修复这个文件吗」" if _ast == "off"
+        else "  <== 仍开启，可能弹「需要修复这个文件吗」"))
     say("DNS 实际探测 : （用 ping，不用 Resolve-DnsName —— 后者会读 hosts 给出假通过）")
     try:
         pres, pn, pt = probe_hosts_block(quiet=True)
