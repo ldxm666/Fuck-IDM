@@ -609,3 +609,20 @@ Windows 注册表/ACL 行为。请在你的**自有软件副本**上使用，并
 - 感谢所有提供实机复现环境与对照实验的贡献者 —— 没有 A/B 对照就没有「受控验证」这四个字。
 
 <p align="right"><sub>Fuck IDM · 跑一次，永久生效，无守护。</sub></p>
+
+### 工具 D：`block-corrupt-popup`（弹窗拦截器，治标）
+
+`IDM is corrupt` 的根因是 **IDM 检测到主程序被改**，所以只要补丁在，它迟早会弹。
+彻底封死需要 patch 判定代码；在那之前，这个 Frida 脚本可以**直接让弹窗不显示**：
+
+```powershell
+python src\scripts\block-corrupt-popup.py     # 常驻 24h，自动附加所有 IDMan.exe（含 -Embedding）
+```
+
+- hook `MessageBoxW` / `MessageBoxA`
+- 标题含 `corrupt` 或正文含 `executive file is damaged` → **直接返回 IDOK**（不显示）
+- 命中时打印完整调用栈到 `.block_corrupt.log`
+- **零侵入**：不改文件、不改注册表、不重启 IDM
+
+> 依赖 `frida` + `frida-tools`：`pip install frida frida-tools`
+> 这是**治标**手段（弹窗被吞掉，IDM 功能不受影响）；根治仍需 patch 判定点。

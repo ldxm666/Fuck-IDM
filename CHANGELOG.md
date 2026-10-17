@@ -299,3 +299,71 @@ IDM 主窗口    正常
 ---
 
 ## [1.0.0] - 2026-10-17
+### 追加（同日第五轮：**抓到弹窗现场 + 定位代码 + 拦截器**）
+
+**现场（21:00，真实捕获）**
+
+```
+hwnd=0x2b1588  pid=61760  title='IDM is corrupt'
+pid 61760 启动: 2026-10-17 20:50:20
+命令行: "IDMan.exe" -Embedding      ← OLE/COM 嵌入 = 浏览器集成拉的实例
+正文: The main IDM executive file is damaged. It's possible that it was infected with a virus...
+```
+
+**关键发现：触发者是 `-Embedding` 实例**（浏览器点下载时由 COM 拉起的独立进程），
+启动后约 **10 分钟**弹一次，弹完不再重弹。
+
+**代码定位（pefile 手工分析）**
+
+| 项 | 值 |
+| --- | --- |
+| 正文首段 | `The main IDM executive file is damaged.` @ raw `0x379DCC` = **VA `0x77C5CC`**（XOR `0x3D`） |
+| 唯一引用点 | **`0x004A8BF9`** `push 0x77C5CC` |
+| 语言分支 | `0x004A8BD9` `cmp eax, 0x804` / `je 0x4A8C07`（0x804=2052=中文） |
+| 字符串表构造 | `0x004A8510`（17 组 × 6 字符串，共 17 处 call） |
+
+**这 6 个字符串就是 corrupt 弹窗的完整文案**（英文组，全部 XOR `0x3D`）：
+
+```
+0x77C5CC -> "The main IDM executive file is damaged."
+0x77C610 -> "To continue downloading, please download the latest version of IDM from our website and install it over your current version"
+0x77C690 -> "Or, wait a few seconds for the "Continue Download" button to become available."
+0x77C6E0 -> "Please read our website for more information."
+0x77C710 -> "Continue downloading"    (按钮)
+0x77C728 -> "Open IDM site"           (按钮)
+```
+
+中文组（`0x4A8C07` 分支）：
+
+```
+0x77CB90 -> "IDM 主程序文件已损坏。"
+0x77CBB0 -> "要继续下载，请从我们的网站..."
+0x77CC18 -> "或者，请稍等片刻，..."
+0x77CC5C -> "请访问我们的网站了解..."
+0x77CC8C -> "继续下载"       (按钮)
+0x77CC9C -> "打开 IDM 网站"  (按钮)
+```
+
+> 注意：弹窗**标题** `IDM is corrupt` 在本地**全 key 扫 0 命中** —— 说明标题是运行时
+> 拼接/来自服务端，而**正文**是本地字符串表（XOR `0x3D`）。
+
+**新增工具：`block-corrupt-popup`（弹窗拦截器）**
+
+`src/scripts/block-corrupt-popup.js` + `.py`
+
+- hook `MessageBoxW` / `MessageBoxA`
+- 标题含 `corrupt` 或正文含 `executive file is damaged` → **直接返回 IDOK（不显示）**
+- 命中时打印**完整调用栈**（模块+偏移）到 `.block_corrupt.log`
+- 自动附加**所有** `IDMan.exe` 实例（含 `-Embedding`），24h 常驻
+- **零侵入**：不改文件、不改注册表、不重启 IDM
+
+```powershell
+pip install frida frida-tools
+python src\scripts\block-corrupt-popup.py
+```
+
+> 这是**治标**（弹窗被吞掉，功能不受影响）；根治要 patch `0x004A8BF9` 附近的判定分支。
+
+---
+
+## [1.0.0] - 2026-10-17
