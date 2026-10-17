@@ -174,6 +174,44 @@ netsh advfirewall firewall add rule name="FuckIDM-Block-AuthServers" ^
 > `0.0.0.0 internetdownloadmanager.com` **不会**拦住
 > `www.internetdownloadmanager.com`。必须逐个写。
 
+### 为什么 hosts 的屏蔽行总被拆掉？加 ACL 也挡不住？
+
+**因为 IDM 装了一个内核文件系统驱动。**
+
+```powershell
+sc query idmwfp
+# SERVICE_NAME: idmwfp
+#         TYPE               : 2  FILE_SYSTEM_DRIVER     ← 文件系统驱动
+#         STATE              : 4  RUNNING
+#         START_TYPE         : 2  AUTO_START
+#         BINARY_PATH_NAME   : \SystemRoot\System32\drivers\idmwfp.sys
+```
+
+它挂在**文件系统栈**上，**在 ACL 检查之前/之后都能直接操作文件** ——
+所以 `Everyone:(DENY)(DE,WD)` 对它**完全无效**。实测时间线（同一天六次观测）：
+
+| 时刻 | 事件 | hosts |
+| --- | --- | --- |
+| 16:00:18 | 手动取消注释 | **11 行** |
+| 16:00:40 | IDM 启动后 1 秒 | **6 行被重新注释** |
+| 16:02:04 | 加 `DENY(DE,WD)` 再修 | **11 行** |
+| 16:02:18 | IDM 重启后 3 秒 | **又是 6 行** |
+| 16:37:21 | 用 `RunLevel=Limited` 计划任务启动 | **仍被改** |
+| **16:38:34** | **`sc stop idmwfp` + `start= disabled`** | 修回 11 行 |
+| 16:41:38→16:43:38 | 连续 120 s 观测 | **恒 11 行，mtime 不变** ✅ |
+
+**修复**：`--activate` 会自动
+
+1. `sc stop idmwfp`
+2. `sc config idmwfp start= disabled`
+3. 把安装目录里的 `idmwfp*.sys` / `idmtdi*.sys` **副本改名**（防 IDM 装回来）
+
+> ⚠️ **`RunLevel=Limited` 对 Administrator 账户无效** —— 仍属 Administrators 组、
+> 仍有 `SeRestorePrivilege`，所以「降 IDM 权限」这条路走不通，**必须停驱动**。
+
+**代价**：IDM 的「高级浏览器集成」会失效（浏览器里点下载不再自动接管）。
+**手动「添加任务」/ 拖链接 / 剪贴板监听不受影响**。要恢复：`--uninstall`（会 `start= auto` 并还原 .sys）。
+
 ### 怎么确认已经挡住
 
 1. `--status` 看两项：`hosts 屏蔽：生效 11/11` + `防火墙阻断：已生效`

@@ -152,12 +152,13 @@ b15 的 counterfeit 弹窗有**两条独立显示路径**，其中一条在**另
 
 ```text
 release/IDM-Activator.exe
-  SHA-256  DC7020E7D364F4A6EC4C5E7F178A398D633E0E8E98402BA231045A3F41E2202A
-  Size     8,522,931 bytes        (v1.0.1：含防火墙阻断 + hosts ACL + 更新包隔离)
+  SHA-256  D1FAD6FF6DCCEB7469E0412D9C02A268159CFCDC3E05598B1303CB1B62921666
+  Size     8,526,170 bytes        (v1.0.1：防火墙 + hosts ACL + 更新包隔离 + 驱动停用)
   PE       MZ / PE32+ (x64) / PyInstaller onefile / manifest 要求 UAC 提权
 ```
 
-> 历史产物：v1.0.1 初版 `DDF8EEA2…`（8,520,829 B）、v1.0.0 `205C9B22…`（8,513,859 B）。
+> 历史产物：v1.0.1 第二轮 `DC7020E7…`（8,522,931 B）、初版 `DDF8EEA2…`（8,520,829 B）、
+> v1.0.0 `205C9B22…`（8,513,859 B）。
 
 完整清单见 [`release/SHA256SUMS.txt`](release/SHA256SUMS.txt)。
 
@@ -304,6 +305,10 @@ print(idm_engine.apply_all(r"C:\...\IDMan.exe"))  # 施加（自动备份）
 │  └─ (c) 防火墙出站阻断 IDMan.exe → 67.18.0.0/16                          │
 │           → hosts 只挡浏览器，挡不住 IDMan.exe 自己（见 FAQ Q5）         │
 │           → 只挡 IDM 服务器网段，**不影响正常下载**                      │
+│  └─ (d) 停用内核驱动 idmwfp（★ 改 hosts 的真正元凶）                     │
+│           → TYPE=2 文件系统驱动，挂在文件系统栈上，**ACL 完全无效**      │
+│           → 停用后 hosts 才真的保得住（见 FAQ Q6）                       │
+│           → 代价：IDM「高级浏览器集成」失效；手动添加任务不受影响        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 

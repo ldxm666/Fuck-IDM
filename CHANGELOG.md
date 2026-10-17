@@ -113,6 +113,59 @@ python src\scripts\hook-corrupt-popup.py      # 自动找 IDMan.exe pid，挂 30
 
 ---
 
+### 追加修复（同日第三轮：**找到元凶了 —— 是内核驱动**）
+
+前两轮都在用户态打转，这轮 `sc query` 一看就明白了：
+
+```
+SERVICE_NAME: idmwfp
+        TYPE               : 2  FILE_SYSTEM_DRIVER     ← 文件系统驱动
+        STATE              : 4  RUNNING
+        START_TYPE         : 2  AUTO_START
+        DEPENDENCIES       : BFE
+        BINARY_PATH_NAME   : \SystemRoot\System32\drivers\idmwfp.sys
+```
+
+**`idmwfp` 是挂在文件系统栈上的内核驱动**，**在 ACL 检查之前/之后都能直接操作文件** ——
+所以 hosts 加 `Everyone:(DENY)(DE,WD)` 也挡不住它。完整时间线：
+
+| 时刻 | 事件 | hosts |
+| --- | --- | --- |
+| 16:00:18 | 手动取消注释 | **11 行** |
+| 16:00:39 | IDM 启动（`/onboot`） | — |
+| **16:00:40** | **6 行被重新注释** | 5 行 |
+| 16:02:04 | 加 `DENY(DE,WD)` 再修 | **11 行** |
+| 16:02:15 | IDM 重启 | — |
+| **16:02:18** | **又是 6 行** | 5 行 |
+| 16:37:21 | 用 `RunLevel=Limited` 计划任务启动 IDM | 5 行（**仍被改**） |
+| **16:38:34** | **`sc stop idmwfp` + `start= disabled`** | 修回 11 行 |
+| 16:38:40 | IDM 启动 | **11 行** |
+| 16:41:38 → 16:43:38 | 连续 120 s 观测 | **恒 11 行，mtime 不变** ✅ |
+
+⇒ **元凶确认：`idmwfp` 内核驱动**。停用后 hosts 才真的保得住。
+
+> 顺带证实：**`RunLevel=Limited` 对 Administrator 账户无效**（仍属 Administrators 组，
+> 仍有 SeRestorePrivilege）—— 所以「降 IDM 权限」这条路走不通，**必须停驱动**。
+
+**本轮改动**
+
+- 新增 `disable_wfp_driver()` / `restore_wfp_driver()` / `wfp_driver_state()`
+  - `sc stop idmwfp` → `sc config idmwfp start= disabled`
+  - **安装目录里的 `idmwfp*.sys` / `idmtdi*.sys` 副本改名** `.disabled-fuckidm`（防 IDM 装回来）
+  - `do_activate [5.7/8]` 调用、`do_status` 显示、`do_uninstall [5.7/6]` 恢复
+- **实测代价**：IDM 的「高级浏览器集成」失效（浏览器点下载不再自动接管）；
+  **手动「添加任务」/ 拖链接 / 剪贴板监听不受影响**。`--uninstall` 可完全恢复。
+
+**验证（--status）**
+
+```
+hosts 屏蔽   : 生效 11/11 个域名
+IDM 更新包   : 已清理（备份：idmupdt.exe.bak-fuckidm）
+内核驱动     : disabled（STATE=STOPPED START_TYPE=DISABLED）  <== 已停用，hosts 不会被 IDM 拆掉
+```
+
+---
+
 ## [1.0.0] - 2026-10-17
 
 首个开源版本。基线：IDM **6.43 Build 15**，24 点全量补丁（`eca4afdc…`），实机装机 MATCH。

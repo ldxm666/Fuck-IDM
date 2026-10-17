@@ -1030,6 +1030,123 @@ def restore_update_package(quiet=False):
 
 
 # --------------------------------------------------------------------------- #
+# 层 C 第五层：停用 IDM 的内核文件系统驱动 `idmwfp`（★ 改 hosts 的真正元凶）
+#
+# ★ 根因（2026-10-17 实测确认）：
+#   `sc query idmwfp` 显示 **TYPE = 2 (FILE_SYSTEM_DRIVER)**、AUTO_START、依赖 BFE。
+#   它挂在文件系统栈上，**在 ACL 检查之前/之后都能直接操作文件** ——
+#   所以 hosts 加 `Everyone:(DENY)(DE,WD)` 也挡不住它。
+#   实测时间线（同一天六次观测）：
+#     16:00:18 手动取消注释 -> hosts 11 行
+#     16:00:39 IDM 启动（/onboot）
+#     16:00:40 hosts 6 行被重新注释
+#     16:02:04 加 DENY(DE,WD) 再修 -> 11 行
+#     16:02:15 IDM 重启
+#     16:02:18 又是 6 行被注释      ← ACL 完全无效
+#     16:38:34 sc stop idmwfp + config disabled -> 修 hosts 11 行
+#     16:38:40 IDM 启动
+#     16:41:38 起连续 120s 观测：hosts 恒为 11 行、mtime 不变  ← ★ 元凶确认
+#
+# ⚠️ 代价：IDM 的「高级浏览器集成」（注册表 AdvIntDriverEnabled2=1）会失效 ——
+#   浏览器里点下载不再自动接管。手动「添加任务」/ 拖链接 / 剪贴板监听**不受影响**。
+#   要恢复：`--uninstall` 会 `sc config idmwfp start= auto` 并还原安装目录里的 .sys 副本。
+# --------------------------------------------------------------------------- #
+WFP_SERVICE = "idmwfp"
+
+
+def _sc(args, timeout=20):
+    """跑一条 sc 命令，返回 (rc, 输出文本)。"""
+    try:
+        p = subprocess.run(["sc"] + list(args), capture_output=True, timeout=timeout,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (p.stdout or b"").decode("mbcs", "replace") + (p.stderr or b"").decode("mbcs", "replace")
+        return p.returncode, out
+    except Exception as exc:
+        return -1, str(exc)
+
+
+def wfp_driver_state():
+    """返回 (state, detail)。state ∈ {"running", "disabled", "stopped", "absent", "unknown"}。"""
+    rc, out = _sc(["query", WFP_SERVICE])
+    if rc != 0:
+        return "absent", "驱动服务 %s 不存在（可能已卸载或从未安装）" % WFP_SERVICE
+    m = re.search(r"STATE\s*:\s*(\d)", out)
+    st = m.group(1) if m else "?"
+    rc2, out2 = _sc(["qc", WFP_SERVICE])
+    m2 = re.search(r"START_TYPE\s*:\s*(\d)", out2)
+    start = m2.group(1) if m2 else "?"
+    names = {"1": "STOPPED", "2": "START_PENDING", "3": "STOP_PENDING", "4": "RUNNING"}
+    starts = {"0": "BOOT", "1": "SYSTEM", "2": "AUTO", "3": "DEMAND", "4": "DISABLED"}
+    detail = "STATE=%s START_TYPE=%s" % (names.get(st, st), starts.get(start, start))
+    if start == "4" and st != "4":
+        return "disabled", detail
+    if st == "4":
+        return "running", detail
+    return "stopped", detail
+
+
+def disable_wfp_driver(install_dir=None, quiet=False):
+    """停用 + 禁用 idmwfp 驱动，并把安装目录里的 .sys 副本改名（幂等）。
+
+    返回 (ok, 说明)。这是**修好 hosts 被反复拆掉**的关键一步。
+    """
+    notes = []
+    # 1) 停止（已在停就跳过）
+    rc, out = _sc(["stop", WFP_SERVICE])
+    if rc == 0:
+        notes.append("已停止")
+    elif "1062" in out or "尚未启动" in out or "not been started" in out.lower():
+        notes.append("本来就是停止状态")
+    else:
+        notes.append("停止返回 rc=%s" % rc)
+    time.sleep(1)
+    # 2) 设为 disabled（开机不加载）
+    rc2, out2 = _sc(["config", WFP_SERVICE, "start=", "disabled"])
+    notes.append("设为 DISABLED" if rc2 == 0 else "config 失败 rc=%s" % rc2)
+    # 3) 安装目录里的驱动副本改名（防止 IDM 重新装回来）
+    renamed = 0
+    if install_dir and os.path.isdir(install_dir):
+        for fn in os.listdir(install_dir):
+            if fn.lower().startswith(("idmwfp", "idmtdi")) and fn.lower().endswith(".sys"):
+                src = os.path.join(install_dir, fn)
+                try:
+                    if not os.path.exists(src + ".disabled-fuckidm"):
+                        os.replace(src, src + ".disabled-fuckidm")
+                        renamed += 1
+                except Exception:
+                    pass
+    if renamed:
+        notes.append("安装目录驱动副本改名 %d 个" % renamed)
+    st, det = wfp_driver_state()
+    if not quiet:
+        log("  驱动 idmwfp：%s（%s）" % (st, det))
+        log("  ⚠️ 代价：IDM 的「高级浏览器集成」会失效；手动添加任务/拖链接不受影响")
+    if st in ("disabled", "stopped", "absent"):
+        return True, "；".join(notes) + "（当前 %s）" % det
+    return False, "驱动仍未停用（%s）" % det
+
+
+def restore_wfp_driver(install_dir=None, quiet=False):
+    """把 idmwfp 恢复成 AUTO_START，并还原安装目录里的 .sys 副本（幂等）。"""
+    renamed_back = 0
+    if install_dir and os.path.isdir(install_dir):
+        for fn in os.listdir(install_dir):
+            if fn.lower().endswith(".sys.disabled-fuckidm"):
+                src = os.path.join(install_dir, fn)
+                dst = src[: -len(".disabled-fuckidm")]
+                try:
+                    os.replace(src, dst)
+                    renamed_back += 1
+                except Exception:
+                    pass
+    rc, out = _sc(["config", WFP_SERVICE, "start=", "auto"])
+    if not quiet:
+        log("  驱动 idmwfp：已恢复 AUTO_START（rc=%s）%s"
+            % (rc, "，还原 .sys 副本 %d 个" % renamed_back if renamed_back else ""))
+    return True, "已恢复（下次开机加载；需要立即生效请重启）"
+
+
+# --------------------------------------------------------------------------- #
 # 文件不可变（DENY ACE）—— 替代守护的关键一步
 # --------------------------------------------------------------------------- #
 
@@ -1542,6 +1659,16 @@ def do_activate(args, install_dir):
     else:
         say("  已跳过（隔离护栏）")
 
+    # ---------------- [5.7/8] 停用 idmwfp 内核文件系统驱动 ----------------
+    # ★ 这是 hosts 被反复拆掉的**真正元凶**：idmwfp 是 TYPE=2 文件系统驱动，
+    #   挂在文件系统栈上，ACL(DENY) 对它完全无效。停用后 hosts 才真的保得住。
+    say("[5.7/8] 停用 IDM 内核文件系统驱动 idmwfp（改 hosts 的元凶）...")
+    if sys_ok:
+        wok, wmsg = disable_wfp_driver(install_dir)
+        say("  %s %s" % ("OK  " if wok else "!!  ", wmsg))
+    else:
+        say("  已跳过（隔离护栏）")
+
     # ---------------- [6/8] 文件不可变 ----------------
     say("[6/8] 设置 IDMan.exe 不可变（替代守护：官方更新包无法覆盖补丁）...")
     if not sys_ok:
@@ -1717,6 +1844,11 @@ def do_status(install_dir):
     #   所以这里额外做一次 ping 级探测，把「文件写了」和「真的拦住了」区分开。
     _ust, _udet = update_package_state()
     say("IDM 更新包   : %s" % _udet)
+    _wst, _wdet = wfp_driver_state()
+    say("内核驱动     : %s（%s）%s" % (
+        _wst, _wdet,
+        "  <== 已停用，hosts 不会被 IDM 拆掉" if _wst in ("disabled", "stopped", "absent")
+        else "  <== 仍在运行！它会绕过 ACL 改 hosts，建议跑 --activate"))
     say("DNS 实际探测 : （用 ping，不用 Resolve-DnsName —— 后者会读 hosts 给出假通过）")
     try:
         pres, pn, pt = probe_hosts_block(quiet=True)
@@ -1878,6 +2010,13 @@ def do_uninstall(install_dir, args=None):
     if sys_ok:
         _rok, _rmsg = restore_update_package()
         say("  %s" % _rmsg)
+    else:
+        say("  已跳过（隔离护栏）")
+
+    say("[5.7/6] 恢复 IDM 内核驱动 idmwfp ...")
+    if sys_ok:
+        _wok, _wmsg = restore_wfp_driver(install_dir)
+        say("  %s" % _wmsg)
     else:
         say("  已跳过（隔离护栏）")
 
