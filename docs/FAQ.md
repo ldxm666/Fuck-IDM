@@ -135,6 +135,67 @@ icacls "<IDMan.exe>" /remove:d Everyone
 
 ---
 
+## 三·五、专项：`IDM is corrupt`（主程序已损坏）弹窗
+
+> 症状：**后台挂一段时间后**弹出 `IDM is corrupt`，正文大意是
+> "The main IDM executive file is damaged. It's possible that it was infected with a virus…"
+
+### 根因：hosts 挡不住 IDMan.exe 自己
+
+IDM 自带的 `Languages\*.lng` 里就写着：
+
+> *"IDM will check for updates successfully even with your damaged hosts file."*
+> （就算你把 hosts 改坏了，IDM 照样能检查更新。）
+
+实测也印证：hosts 6/6 全绿时，`www.` / `secure.` / `register.internetdownloadmanager.com`
+仍解析到 `67.18.60.145` / `67.18.140.140` 并可达（`ping` 实测）。
+hosts 是**按域名**拦截，而 IDM 可以直连 IP 或走自己的解析路径。
+
+### 修复（v1.0.1 层 C 第三层）：防火墙出站阻断
+
+```powershell
+netsh advfirewall firewall add rule name="FuckIDM-Block-AuthServers" ^
+  dir=out action=block ^
+  program="C:\Program Files (x86)\Internet Download Manager\IDMan.exe" ^
+  remoteip=67.18.0.0/16 enable=yes profile=any
+```
+
+- 只挡 **67.18.0.0/16**（IDM/tonec 服务器段），**不影响普通下载**
+- `--activate` 自动施加，`--uninstall` 自动移除
+- `--status` 显示：已生效 / 需要管理员权限才能查询 / 未设置
+
+### 顺带修掉的真 bug：hosts 三行被注释
+
+旧版 hosts 里 `www.` / `secure.` / `register.` 三行被写成 `#0.0.0.0 ...`（注释掉了），
+于是「生效 3/6」却被旧检查判成成功（因为旧检查只数「行里含 marker 的行数」）。
+现在 `HOSTS_DOMAINS` 扩到 **11 个**，`hosts_state()` 只统计**真正生效**的行。
+
+> ⚠️ **父域名屏蔽 ≠ 子域名屏蔽**。hosts 是精确匹配：
+> `0.0.0.0 internetdownloadmanager.com` **不会**拦住
+> `www.internetdownloadmanager.com`。必须逐个写。
+
+### 怎么确认已经挡住
+
+1. `--status` 看两项：`hosts 屏蔽：生效 11/11` + `防火墙阻断：已生效`
+2. `ping www.internetdownloadmanager.com` → 应「不可达 / 无解析」
+3. 挂机观察 ≥ 40 分钟（弹窗是周期性的）
+4. 若仍弹，请提供：弹窗**完整截图** + **精确标题** + `--status` 全文 +
+   弹窗时刻前后的 `%LOCALAPPDATA%\IDM-Activator\activator.log`
+
+### 已排除的方向（避免重复劳动）
+
+| 方向 | 结论 |
+| --- | --- |
+| 补丁完整性 | ✅ 20/24 点认回，自证哈希 = 装机 `B6C45453…` |
+| PE CheckSum | ✅ stored = 计算值（`ensure_pe_checksum` 已处理） |
+| 数字签名校验 | ❌ IDM **没有** `WinVerifyTrust` 导入 → 不是签名问题 |
+| 「检查更新」菜单（网络放开 A/B） | 90 s 无弹窗 → 不是这条命令直接触发 |
+| 下载触发（1 MB 本地 HTTP） | 150 s 无弹窗 |
+| 文案定位 | `The main IDM executive file is damaged.` @ `.data` VA `0x37C5CC`（XOR `0x3D`） |
+| 完整正文 | **不在本地任何文件**（11 个 exe/dll/lng 全扫）→ 服务端下发 |
+
+---
+
 ## 四、开发 / 贡献
 
 ### Q15：新版 IDM 出来了怎么办？

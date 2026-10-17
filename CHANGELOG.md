@@ -3,6 +3,53 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.1] - 2026-10-17
+
+修复实机反馈的 **「后台挂一段时间后弹 `IDM is corrupt`（主程序已损坏）」**。
+
+### 根因
+
+IDM 会**绕过 hosts** 直连授权/更新服务器做联网校验，发现主程序被修改后弹损坏提示。
+两条独立证据：
+
+1. **官方自述**：`Languages\*.lng` 里原文写着
+   *"IDM will check for updates successfully even with your damaged hosts file."*
+2. **实测**：hosts 6/6 全绿时，`www.` / `secure.` / `register.internetdownloadmanager.com`
+   仍解析到 `67.18.60.145` / `67.18.140.140`，`ping` 可达。
+
+### 修复
+
+- **新增层 C 第三层：防火墙出站阻断**（`FuckIDM-Block-AuthServers`）
+  - `dir=out action=block program=<IDMan.exe> remoteip=67.18.0.0/16 profile=any`
+  - 只挡 IDM 服务器网段，**不影响正常下载**
+  - `--activate` 施加 / `--uninstall` 移除 / `--status` 显示
+- **修掉一个真 bug：hosts 3 行被注释导致「生效 3/6 却判成功」**
+  - `HOSTS_DOMAINS` 从 6 个扩到 **11 个**：补 `update.` / `support.` / `idm.` 与
+    `secure.tonec.com` / `register.tonec.com`
+  - 起因：hosts 是**精确匹配**，写 `internetdownloadmanager.com` 并不覆盖
+    `www.internetdownloadmanager.com` —— 父域名屏蔽 ≠ 子域名屏蔽
+- `firewall_state()` 区分「无规则」与「无权查询」：非管理员下 `netsh` 返回
+  `requires elevation` 时返回 `unknown`，**不再误报「未设置」**
+
+### 排查记录（供后续复现）
+
+| 观测 | 结论 |
+| --- | --- |
+| 补丁完整性 | ✅ 20/24 点认回，自证哈希 = 装机 `B6C45453…` |
+| PE CheckSum | ✅ stored = 计算值（引擎 `ensure_pe_checksum` 已处理） |
+| 数字签名校验 | ❌ IDM **没有** `WinVerifyTrust` 导入 → corrupt 不是签名问题 |
+| 「检查更新」菜单（网络放开 A/B） | 90 s 无弹窗 → 不是这条命令直接触发 |
+| 下载触发（1 MB 本地 HTTP） | 150 s 无弹窗 |
+| 文案定位 | `The main IDM executive file is damaged.` @ `.data` VA `0x37C5CC`（XOR `0x3D`） |
+| 完整正文 | **不在本地任何文件**（11 个 exe/dll/lng 全扫）→ 服务端下发 |
+
+### 新增
+
+- `README` 新增 FAQ **Q5**（corrupt 弹窗的成因与三层防御）
+- `docs/FAQ.md` 同步该章节
+
+---
+
 ## [1.0.0] - 2026-10-17
 
 首个开源版本。基线：IDM **6.43 Build 15**，24 点全量补丁（`eca4afdc…`），实机装机 MATCH。

@@ -90,7 +90,7 @@ IDM 6.43 的试用到期后，用户会遇到三类症状，而这三类症状�
 
 | 环节 | 本项目的处理 |
 | --- | --- |
-| 序列号出不了本机 | **层 C**：hosts 屏蔽 6 个授权/校验域名 + `ipconfig /flushdns` |
+| 序列号出不了本机 | **层 C**：hosts 屏蔽 **11 个**授权/校验域名 + `ipconfig /flushdns` + 防火墙阻断 `67.18.0.0/16` |
 | 判定成立也不许自杀 | **P5**：封死 4 处 tripwire 出口（3×`ExitProcess(0)` + 1×分支） |
 | 判定成立也不许弹窗 | **P6 / P7 / P8 / P10 / P11 / P14**：从产生端、广播线程、显示端、包装器四个层次封 |
 | 记账标记不许写 | **P9**：封死 `MData` 的唯一活写入点 |
@@ -152,9 +152,12 @@ b15 的 counterfeit 弹窗有**两条独立显示路径**，其中一条在**另
 
 ```text
 release/IDM-Activator.exe
-  SHA-256  205C9B22DD50F0DDA9AA8E0CEC355AD08BB4CCEE94BD37CE4C2E6410C439071C
-  Size     8,513,859 bytes
+  SHA-256  DDF8EEA26EA0FD61F288AA532FE4AEA5849F8A416652C93837530D8EAA55B295
+  Size     8,520,829 bytes        (v1.0.1：含防火墙阻断层)
+  PE       MZ / PE32+ (x64) / PyInstaller onefile / manifest 要求 UAC 提权
 ```
+
+> v1.0.0 的旧产物是 `205C9B22…`（8,513,859 B），已被 v1.0.1 取代。
 
 完整清单见 [`release/SHA256SUMS.txt`](release/SHA256SUMS.txt)。
 
@@ -296,8 +299,11 @@ print(idm_engine.apply_all(r"C:\...\IDMan.exe"))  # 施加（自动备份）
 │  ├─ (a) 文件不可变：icacls IDMan.exe /deny *S-1-1-0:(WD,DE)              │
 │  │        → 官方更新包无法覆盖或删除补丁后的二进制（**这是免守护的关键**）│
 │  │        → 施加后必须回读 ACL 验证（回读时 SID 会显示为 Everyone）      │
-│  └─ (b) hosts 屏蔽 6 个授权/校验域名 → 0.0.0.0                          │
+│  └─ (b) hosts 屏蔽 11 个授权/校验域名 → 0.0.0.0                         │
 │           → 域名级拦截，抗 IP 漂移；写完必须 ipconfig /flushdns          │
+│  └─ (c) 防火墙出站阻断 IDMan.exe → 67.18.0.0/16                          │
+│           → hosts 只挡浏览器，挡不住 IDMan.exe 自己（见 FAQ Q5）         │
+│           → 只挡 IDM 服务器网段，**不影响正常下载**                      │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -552,6 +558,30 @@ python .\src\idm_engine.py --list "C:\path\to\IDMan.exe"
 **Q4：加了 ACL 之后 Frida 注入失败了？**
 `DENY(W,D)` 会让 Frida spawn 报 `0x00000005`（Frida 注入需要该 exe 的写权限）。
 需要动态观测前先 `icacls "<IDMan.exe>" /remove:d Everyone`，观测结束后再重新施加。
+
+**Q5：后台挂一段时间后弹「IDM is corrupt / 主程序已损坏」，hosts 明明已经屏蔽了？**
+因为 **hosts 挡不住 IDM 自己**。IDM 自带的 `Languages\*.lng` 里就写着：
+
+> *"IDM will check for updates successfully even with your damaged hosts file."*
+> （就算你把 hosts 改坏了，IDM 照样能检查更新。）
+
+实测也印证了这一点：hosts 6/6 全绿时，`www.` / `secure.` / `register.internetdownloadmanager.com`
+仍解析到 `67.18.60.145` / `67.18.140.140` 并可达。所以 v1.0.1 起加了**层 C 第三层**：
+
+```powershell
+# 出站阻断 IDMan.exe -> IDM 授权/更新服务器网段（不影响普通下载）
+netsh advfirewall firewall add rule name="FuckIDM-Block-AuthServers" ^
+  dir=out action=block program="C:\Program Files (x86)\Internet Download Manager\IDMan.exe" ^
+  remoteip=67.18.0.0/16 enable=yes profile=any
+```
+
+`--activate` 会自动施加；`--uninstall` 会自动移除；`--status` 会显示
+「已生效 / 需要管理员权限才能查询 / 未设置」。
+
+**顺带修掉的一个真 bug**：旧版 hosts 里 `www.` / `secure.` / `register.` 三行被写成了
+`#0.0.0.0 ...`（注释掉），于是「生效 3/6」却被旧检查判成成功。
+现在 `HOSTS_DOMAINS` 扩到 **11 个**（含 `update.` / `support.` / `idm.` 与 tonec 子域），
+`hosts_state()` 只统计**真正生效**的行（行首不是 `#`）。
 
 ---
 

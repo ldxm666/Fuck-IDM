@@ -123,12 +123,22 @@ HOSTS_PATH = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
 HOSTS_BACKUP = HOSTS_PATH + ".bak-permanentfix"
 HOSTS_MARKER = "# IDM-Activator-PermanentFix"
 HOSTS_DOMAINS = (
+    # 主域名 + 全部已知子域名。
+    # ⚠️ hosts 是**精确匹配**，不认通配：写了 internetdownloadmanager.com
+    #    并不覆盖 www./secure./register. 三个子域名。实测踩过这个坑 ——
+    #    父域名已屏蔽，但 ping www.internetdownloadmanager.com 仍解析到
+    #    67.18.60.145（真实服务器），于是 IDM 的联网校验照旧能跑。
     "internetdownloadmanager.com",
     "www.internetdownloadmanager.com",
     "secure.internetdownloadmanager.com",
     "register.internetdownloadmanager.com",
+    "update.internetdownloadmanager.com",
+    "support.internetdownloadmanager.com",
+    "idm.internetdownloadmanager.com",
     "tonec.com",
     "www.tonec.com",
+    "secure.tonec.com",
+    "register.tonec.com",
 )
 
 # 已知哈希（仅用于**提示**，不用于判定成败）
@@ -828,6 +838,96 @@ def restore_hosts(quiet=False):
 
 
 # --------------------------------------------------------------------------- #
+# 层 C 第三层：防火墙出站阻断 —— 挡住 IDM 直连授权/更新服务器
+#
+# ★ 为什么 hosts 不够（实测 + 官方自述）：
+#   1. IDM 自带的 Languages\*.lng 里明确写着
+#        "IDM will check for updates successfully even with your damaged hosts file"
+#      —— hosts 只挡浏览器，挡不住 IDMan.exe 自己。
+#   2. 实测：hosts 6/6 全绿时，www./secure./register.internetdownloadmanager.com
+#      仍解析到 67.18.60.145 / 67.18.140.140，ping 可达。
+#   3. 后果：联网校验判定主程序被修改 → 弹 "IDM is corrupt / 主程序已损坏"
+#      （文案前半句 "The main IDM executive file is damaged." 就内嵌在
+#       IDMan.exe 的 .data 里，XOR 0x3D 编码）。
+#
+# ★ 为什么只挡 IP 段、不整体断网：
+#   IDM 的本职是下载，整体断网等于废掉它。67.18.0.0/16 是 IDM/tonec 的服务器段
+#   （67.18.60.145 / 67.18.140.140 都在内），与用户下载的目标站点无关。
+# --------------------------------------------------------------------------- #
+FW_RULE = "FuckIDM-Block-AuthServers"
+FW_REMOTE = "67.18.0.0/16"
+
+
+def _netsh(args, timeout=25):
+    """跑一条 netsh 命令，返回 (rc, 输出文本)。输出按 mbcs 解码（中文系统是 GBK）。"""
+    try:
+        p = subprocess.run(["netsh"] + list(args), capture_output=True, timeout=timeout,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (p.stdout or b"").decode("mbcs", "replace") + (p.stderr or b"").decode("mbcs", "replace")
+        return p.returncode, out
+    except Exception as exc:
+        return -1, str(exc)
+
+
+def firewall_state():
+    """返回 (state, detail)。state ∈ {"block", "none", "unknown"}。
+
+    ⚠️ 非管理员下 `netsh advfirewall show rule` 直接返回
+       "The requested operation requires elevation" 且 rc=1。
+       此时**不能**断言「没有规则」—— 必须返回 unknown，否则 --status 会误报。
+    """
+    rc, out = _netsh(["advfirewall", "firewall", "show", "rule", "name=%s" % FW_RULE])
+    if rc != 0:
+        low = out.lower()
+        if ("requires elevation" in low or "需要提升" in out or "拒绝访问" in out
+                or "access is denied" in low):
+            return "unknown", "查询需要管理员权限（--status 以普通权限运行）"
+        return "none", "未找到规则 %s" % FW_RULE
+    if FW_RULE not in out:
+        return "none", "未找到规则 %s" % FW_RULE
+    enabled = re.search(r"Enabled:\s*Yes", out) is not None
+    m = re.search(r"Action:\s*(\w+)", out)
+    act = m.group(1) if m else "?"
+    if enabled and act.lower() == "block":
+        return "block", "出站阻断 -> %s" % FW_REMOTE
+    return "unknown", "规则存在但未生效（Enabled=%s Action=%s）" % (enabled, act)
+
+
+def apply_firewall_block(install_dir, quiet=False):
+    """加/刷新出站阻断规则（幂等）。返回 (ok, 说明)。"""
+    exe = os.path.join(install_dir, "IDMan.exe")
+    if not os.path.isfile(exe):
+        return False, "找不到 %s，跳过防火墙规则" % exe
+    remove_firewall_block(quiet=True)                     # 幂等：先删再加
+    rc, out = _netsh([
+        "advfirewall", "firewall", "add", "rule",
+        "name=%s" % FW_RULE,
+        "dir=out", "action=block",
+        "program=%s" % exe,
+        "remoteip=%s" % FW_REMOTE,
+        "enable=yes", "profile=any",
+        "description=Block IDM auth/update servers (hosts cannot stop IDMan.exe itself)",
+    ])
+    st, det = firewall_state()
+    if st == "block":
+        if not quiet:
+            log("  防火墙：已阻断 IDMan.exe -> %s（hosts 挡不住的那部分由这层兜底）" % FW_REMOTE)
+        return True, det
+    return False, "防火墙规则未生效：%s" % ((out.strip()[:200]) or det)
+
+
+def remove_firewall_block(quiet=False):
+    """删除出站阻断规则（幂等）。"""
+    rc, out = _netsh(["advfirewall", "firewall", "delete", "rule", "name=%s" % FW_RULE])
+    if not quiet:
+        if rc == 0:
+            log("  防火墙：已移除规则 %s" % FW_RULE)
+        else:
+            log("  防火墙：本来就没有规则 %s（无需移除）" % FW_RULE)
+    return True, "已移除（或本来不存在）"
+
+
+# --------------------------------------------------------------------------- #
 # 文件不可变（DENY ACE）—— 替代守护的关键一步
 # --------------------------------------------------------------------------- #
 
@@ -1319,6 +1419,17 @@ def do_activate(args, install_dir):
     else:
         say("  %s" % hmsg)
 
+    # ---------------- [5.5/8] 防火墙出站阻断 ----------------
+    # hosts 只挡浏览器，挡不住 IDMan.exe 自己（官方 .lng 里自己承认了这一点）。
+    # 这一层把 IDM 直连授权/更新服务器 IP 段的出站包丢掉，且**不影响正常下载**。
+    say("[5.5/8] 防火墙阻断 IDM 授权/更新服务器（67.18.0.0/16，不影响下载）...")
+    fok, fmsg = False, "已跳过（隔离护栏：不碰实机防火墙）"
+    if sys_ok:
+        fok, fmsg = apply_firewall_block(install_dir)
+        say("  %s %s" % ("OK  " if fok else "!!  ", fmsg))
+    else:
+        say("  %s" % fmsg)
+
     # ---------------- [6/8] 文件不可变 ----------------
     say("[6/8] 设置 IDMan.exe 不可变（替代守护：官方更新包无法覆盖补丁）...")
     if not sys_ok:
@@ -1485,6 +1596,11 @@ def do_status(install_dir):
     for d in HOSTS_DOMAINS:
         say("  %-38s -> 0.0.0.0" % d)
     say("hosts 备份   : %s" % (HOSTS_BACKUP if os.path.exists(HOSTS_BACKUP) else "<无>"))
+    _fst, _fdet = firewall_state()
+    say("防火墙阻断   : %s" % (
+        ("已生效（%s）" % _fdet) if _fst == "block"
+        else ("需要管理员权限才能查询（用管理员跑 --status 可确认）") if _fst == "unknown"
+        else "未设置 —— IDM 可直连授权/更新服务器（hosts 挡不住它）"))
     # ★ 文件内容正确 ≠ 屏蔽真的生效：Windows DNS 客户端缓存会让旧结果继续可用。
     #   所以这里额外做一次 ping 级探测，把「文件写了」和「真的拦住了」区分开。
     say("DNS 实际探测 : （用 ping，不用 Resolve-DnsName —— 后者会读 hosts 给出假通过）")
@@ -1635,6 +1751,12 @@ def do_uninstall(install_dir, args=None):
     if sys_ok:
         if not purge_registration():
             say("  本来就没有（跳过）")
+    else:
+        say("  已跳过（隔离护栏）")
+
+    say("[5.5/6] 移除防火墙阻断规则 ...")
+    if sys_ok:
+        remove_firewall_block()
     else:
         say("  已跳过（隔离护栏）")
 
