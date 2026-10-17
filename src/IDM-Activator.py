@@ -1122,6 +1122,13 @@ def disable_wfp_driver(install_dir=None, quiet=False):
         log("  驱动 idmwfp：%s（%s）" % (st, det))
         log("  ⚠️ 代价：IDM 的「高级浏览器集成」会失效；手动添加任务/拖链接不受影响")
     if st in ("disabled", "stopped", "absent"):
+        # 收尾自证：手动 sc start 必须失败（证明内核特权真的移除了）
+        rc3, out3 = _sc(["start", WFP_SERVICE])
+        if rc3 == 0:
+            # 居然起来了 —— 说明 DISABLED 没生效，回滚为失败
+            _sc(["stop", WFP_SERVICE])
+            return False, "驱动仍可被启动（DISABLED 未生效）：%s" % out3.strip()[:120]
+        notes.append("sc start 已被拒绝（内核特权移除）")
         return True, "；".join(notes) + "（当前 %s）" % det
     return False, "驱动仍未停用（%s）" % det
 

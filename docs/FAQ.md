@@ -209,6 +209,21 @@ sc query idmwfp
 > ⚠️ **`RunLevel=Limited` 对 Administrator 账户无效** —— 仍属 Administrators 组、
 > 仍有 `SeRestorePrivilege`，所以「降 IDM 权限」这条路走不通，**必须停驱动**。
 
+**收尾自证（真的移除了内核特权，不是仅停用）**
+
+```
+sc start idmwfp
+  → [SC] StartService FAILED 1058:
+    The service cannot be started, either because it is disabled
+    or because it has no enabled devices associated with it.
+```
+
+`disable_wfp_driver()` 末尾会主动跑一次 `sc start` **验证必须失败**；若居然成功，立刻
+`sc stop` 并**返回失败**（宁可在日志里报错，也不假装修好了）。
+
+> `idmwfp.sys` 本体由 **TrustedInstaller** 持有（`icacls /deny` 会被拒绝），但**不需要动它**：
+> 服务 DISABLED + `sc start` 被拒 = 加载不了。
+
 **代价**：IDM 的「高级浏览器集成」会失效（浏览器里点下载不再自动接管）。
 **手动「添加任务」/ 拖链接 / 剪贴板监听不受影响**。要恢复：`--uninstall`（会 `start= auto` 并还原 .sys）。
 

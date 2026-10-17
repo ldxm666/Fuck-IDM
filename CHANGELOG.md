@@ -164,6 +164,35 @@ IDM 更新包   : 已清理（备份：idmupdt.exe.bak-fuckidm）
 内核驱动     : disabled（STATE=STOPPED START_TYPE=DISABLED）  <== 已停用，hosts 不会被 IDM 拆掉
 ```
 
+### 收尾加固：把「内核特权」彻底移除（不是仅停用）
+
+`sc config start= disabled` 只保证**开机不加载**，但理论上还能被 `NtLoadDriver` 手动拉起来。
+所以 `disable_wfp_driver()` 末尾加了一条**自证**：
+
+```
+sc start idmwfp
+  → [SC] StartService FAILED 1058:
+    The service cannot be started, either because it is disabled
+    or because it has no enabled devices associated with it.
+```
+
+**启动被拒绝 ⇒ 内核特权真的移除了。** 若 `sc start` 居然成功，函数会立刻 `sc stop` 并**返回失败**
+（宁可在日志里报错，也不假装修好了）。
+
+> `C:\Windows\System32\drivers\idmwfp.sys` 本体由 **TrustedInstaller** 持有
+> （`NT SERVICE\TrustedInstaller:(F)`），`icacls /deny` 会被拒绝 —— 但**不需要动它**：
+> 服务 DISABLED + `sc start` 被拒，已经等于加载不了。
+
+**实测收尾状态（17:48 起连续观测）**
+
+| 项 | 值 |
+| --- | --- |
+| `hosts` | **11/11 行，mtime 16:48:26 恒定不变** |
+| `idmwfp` | `STATE=STOPPED` / `START_TYPE=DISABLED` / `sc start` → **FAILED 1058** |
+| 安装目录驱动副本 | `idmwfp32/64/AA.sys`、`idmtdi32/64.sys` 全部改名 `.disabled-fuckidm` |
+| `idmupdt.exe` | 已隔离 |
+| 弹窗 | GONE |
+
 ---
 
 ## [1.0.0] - 2026-10-17
