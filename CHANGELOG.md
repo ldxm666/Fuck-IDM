@@ -50,6 +50,69 @@ IDM 会**绕过 hosts** 直连授权/更新服务器做联网校验，发现主�
 
 ---
 
+### 追加修复（同日第二轮，实机反馈「又弹了」）
+
+第一轮的 hosts + 防火墙**不够**，因为漏了两件事：
+
+**1. IDM 会主动把 hosts 屏蔽行注释掉（决定性发现）**
+
+实测 2026-10-17：手动取消注释后，IDM 启动数秒内把下面六行**全部重新加上 `#`**：
+
+```
+#0.0.0.0 www.internetdownloadmanager.com
+#0.0.0.0 secure.internetdownloadmanager.com
+#0.0.0.0 register.internetdownloadmanager.com
+#0.0.0.0 update.internetdownloadmanager.com
+#0.0.0.0 support.internetdownloadmanager.com
+#0.0.0.0 idm.internetdownloadmanager.com
+```
+
+而 `tonec.com` / `www.tonec.com` / `secure.tonec.com` / `register.tonec.com` **不动**
+⇒ 这是**针对 internetdownloadmanager.com 的定向修复**，不是随机破坏。
+
+官方 `.lng` 里写得很直白：
+
+> *"Your browser may not open IDM website because an important system file is damaged
+> on your computer. **IDM will repair this file now.**"*
+
+⇒ **修复：给 hosts 加 `DENY(WD)` ACL**（`Everyone:(DENY)(WD)`），IDM 就写不进去了。
+`apply_hosts()` 改为「**写前解除 DENY → 写完加回**」，`restore_hosts()` 同理。
+
+**2. `%APPDATA%\IDM\idmupdt.exe` —— IDM 已下载的更新包（12.5 MB）**
+
+| 项 | 值 |
+| --- | --- |
+| 路径 | `C:\Users\<user>\AppData\Roaming\IDM\idmupdt.exe` |
+| 大小 | 12,559,240 B |
+| 创建 | `2026-10-16 23:02:16`（当时 hosts 只挡 3/6，能联网） |
+| 最后访问 | `2026-10-17 15:51:56`（**紧跟 IDM 重启时刻**） |
+| FileVersion | `6, 43, 15, 1`（Tonec Inc. installer） |
+
+IDM 每次启动后数秒内就 **access** 它，说明它参与版本/完整性比对。
+⇒ 新增 `cleanup_update_package()`：改名为 `.bak-fuckidm` 隔离（**可回滚，不影响已完成的下载**）。
+
+**3. 新增 Frida 抓栈工具**（下次弹窗可直接定位到指令）
+
+`src/scripts/hook-corrupt-popup.js` + `.py`：hook
+`MessageBoxW/A`、`DialogBoxParamW`、`CreateDialogIndirectParamW`、`CreateWindowExW`，
+命中即打印**完整调用栈（模块+偏移）**。
+
+```powershell
+python src\scripts\hook-corrupt-popup.py      # 自动找 IDMan.exe pid，挂 30 分钟
+# 日志：<repo>\.hook-corrupt.log
+```
+
+**4. 排查补充结论**
+
+| 方向 | 结论 |
+| --- | --- |
+| `idmupdt.exe` 恢复 vs 删除（A/B） | 3 分钟窗口内**都不弹** ⇒ 它不是**立即**触发源 |
+| `GlobalErrors.log` 的 `DR2` | 8 条（04:13…12:13），`DR2` 在 exe 里只是字符串池碎片，**与弹窗无时间对应** |
+| 弹窗正文 `infected with a virus` | **全目录 × 256 key × ASCII/UTF-16 全扫 = 0 命中** ⇒ 运行时生成/服务端下发 |
+| 弹窗时刻 | 15:41 抓到 hwnd `#32770`「IDM is corrupt」，正文与用户截图逐字一致 |
+
+---
+
 ## [1.0.0] - 2026-10-17
 
 首个开源版本。基线：IDM **6.43 Build 15**，24 点全量补丁（`eca4afdc…`），实机装机 MATCH。

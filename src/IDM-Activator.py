@@ -760,6 +760,33 @@ def probe_hosts_block(quiet=False):
     return results, n_ok, len(HOSTS_DOMAINS)
 
 
+def _hosts_acl_unlock():
+    """解除 hosts 上的 DENY(WD)。
+
+    ★ 为什么需要：IDM 会**主动把针对 internetdownloadmanager.com 的 hosts 屏蔽行注释掉**
+      （官方 .lng 原文："IDM will repair this file now"）。实测 2026-10-17：手动取消
+      注释后，IDM 启动几秒内又把 www./secure./register./update./support./idm. 六行
+      全部重新加 `#` 前缀，而 tonec.com 的两行不动 —— 说明是定向修复。
+      因此 hosts 必须加 DENY(WD) 保护；但加了之后自己写不进去，所以写前先解、写后加回。
+    """
+    try:
+        subprocess.run(["icacls", HOSTS_PATH, "/remove:d", "Everyone"],
+                       capture_output=True, timeout=20,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
+def _hosts_acl_lock():
+    """给 hosts 加 DENY(WD)，阻止 IDM 再改它（幂等）。"""
+    try:
+        subprocess.run(["icacls", HOSTS_PATH, "/deny", "Everyone:(WD)"],
+                       capture_output=True, timeout=20,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
 def apply_hosts(quiet=False):
     """写 hosts 屏蔽块 + 刷 DNS 缓存（幂等）。返回 (ok, 说明)。
 
@@ -778,9 +805,12 @@ def apply_hosts(quiet=False):
         except Exception as exc:
             log("  [警告] hosts 备份失败：%s" % exc)
     try:
+        _hosts_acl_unlock()
         _write_hosts(kept + hosts_block_lines())
     except Exception as exc:
         return False, "写入 hosts 失败：%s" % exc
+    finally:
+        _hosts_acl_lock()
     # ★ 写完必须刷 DNS 缓存，否则屏蔽可能完全不生效
     flush_dns(quiet=quiet)
     ok, n, want = hosts_state()
@@ -801,6 +831,14 @@ def restore_hosts(quiet=False):
     ★ 还原后也要刷缓存：否则缓存里的 0.0.0.0 会让屏蔽「死而不僵」。
     """
     bak_dirty = _hosts_has_marker(HOSTS_BACKUP)
+    _hosts_acl_unlock()          # 先解 DENY，否则还原写不进去
+    try:
+        return _restore_hosts_inner(bak_dirty, quiet)
+    finally:
+        _hosts_acl_lock()        # 还原完再加回保护
+
+
+def _restore_hosts_inner(bak_dirty, quiet):
     if bak_dirty is False:                      # 备份存在且干净
         try:
             shutil.copy2(HOSTS_BACKUP, HOSTS_PATH)
@@ -925,6 +963,70 @@ def remove_firewall_block(quiet=False):
         else:
             log("  防火墙：本来就没有规则 %s（无需移除）" % FW_RULE)
     return True, "已移除（或本来不存在）"
+
+
+# --------------------------------------------------------------------------- #
+# 层 C 第四层：清掉 IDM 已下载的更新包
+#
+# ★ 为什么：IDM 会把待安装的更新包下载到 %APPDATA%\IDM\idmupdt.exe（约 12.5 MB），
+#   并在**后台反复读取它**做版本/完整性比对。实测（2026-10-17）：
+#     · 该文件 created 2026-10-16 23:02、modified 23:03（当时 hosts 只挡 3/6，能联网）
+#     · IDM 每次启动后数秒内就会 access 它（atime 15:51:56，紧跟重启时刻）
+#     · 它与被修改的 IDMan.exe 一起构成 "IDM is corrupt" 弹窗的判定输入
+#   ⇒ 删掉它（改名保留备份）即可去掉这一路输入，且**不影响任何已完成的下载**。
+# --------------------------------------------------------------------------- #
+UPDATE_PKG = os.path.join(os.environ.get("APPDATA", ""), "IDM", "idmupdt.exe")
+UPDATE_PKG_BAK = UPDATE_PKG + ".bak-fuckidm"
+
+
+def update_package_state():
+    """返回 (state, detail)。state ∈ {"present", "absent", "backup"}。"""
+    if os.path.isfile(UPDATE_PKG):
+        try:
+            sz = os.path.getsize(UPDATE_PKG)
+        except Exception:
+            sz = -1
+        return "present", "存在（%s B）—— IDM 会后台读取它做校验" % sz
+    if os.path.isfile(UPDATE_PKG_BAK):
+        return "backup", "已清理（备份：%s）" % os.path.basename(UPDATE_PKG_BAK)
+    return "absent", "不存在"
+
+
+def cleanup_update_package(quiet=False):
+    """把 idmupdt.exe 改名成 .bak-fuckidm（幂等，可回滚）。返回 (ok, 说明)。"""
+    if not os.path.isfile(UPDATE_PKG):
+        st, det = update_package_state()
+        if not quiet:
+            log("  更新包：%s" % det)
+        return True, det
+    # 需要 IDM 不持有句柄 —— 调用方（--activate）此前已停止 IDM 进程
+    try:
+        if os.path.isfile(UPDATE_PKG_BAK):
+            os.remove(UPDATE_PKG_BAK)
+        os.replace(UPDATE_PKG, UPDATE_PKG_BAK)
+        if not quiet:
+            log("  更新包：已隔离 %s -> %s" % (os.path.basename(UPDATE_PKG),
+                                               os.path.basename(UPDATE_PKG_BAK)))
+        return True, "已隔离（备份 %s）" % os.path.basename(UPDATE_PKG_BAK)
+    except Exception as exc:
+        return False, "隔离更新包失败：%s（先完全退出 IDM 再试）" % exc
+
+
+def restore_update_package(quiet=False):
+    """把 idmupdt.exe 还原回来（幂等）。"""
+    if not os.path.isfile(UPDATE_PKG_BAK):
+        if not quiet:
+            log("  更新包：没有备份，无需还原")
+        return True, "没有备份"
+    try:
+        if os.path.isfile(UPDATE_PKG):
+            os.remove(UPDATE_PKG)
+        os.replace(UPDATE_PKG_BAK, UPDATE_PKG)
+        if not quiet:
+            log("  更新包：已还原 %s" % os.path.basename(UPDATE_PKG))
+        return True, "已还原"
+    except Exception as exc:
+        return False, "还原更新包失败：%s" % exc
 
 
 # --------------------------------------------------------------------------- #
@@ -1430,6 +1532,16 @@ def do_activate(args, install_dir):
     else:
         say("  %s" % fmsg)
 
+    # ---------------- [5.6/8] 隔离 IDM 已下载的更新包 ----------------
+    # %APPDATA%\IDM\idmupdt.exe 是 IDM 后台反复读取的待安装更新包；
+    # 与被修改的 IDMan.exe 一起构成 "IDM is corrupt" 的判定输入。
+    say("[5.6/8] 隔离 IDM 已下载的更新包（idmupdt.exe）...")
+    if sys_ok:
+        uok, umsg = cleanup_update_package()
+        say("  %s %s" % ("OK  " if uok else "!!  ", umsg))
+    else:
+        say("  已跳过（隔离护栏）")
+
     # ---------------- [6/8] 文件不可变 ----------------
     say("[6/8] 设置 IDMan.exe 不可变（替代守护：官方更新包无法覆盖补丁）...")
     if not sys_ok:
@@ -1603,6 +1715,8 @@ def do_status(install_dir):
         else "未设置 —— IDM 可直连授权/更新服务器（hosts 挡不住它）"))
     # ★ 文件内容正确 ≠ 屏蔽真的生效：Windows DNS 客户端缓存会让旧结果继续可用。
     #   所以这里额外做一次 ping 级探测，把「文件写了」和「真的拦住了」区分开。
+    _ust, _udet = update_package_state()
+    say("IDM 更新包   : %s" % _udet)
     say("DNS 实际探测 : （用 ping，不用 Resolve-DnsName —— 后者会读 hosts 给出假通过）")
     try:
         pres, pn, pt = probe_hosts_block(quiet=True)
@@ -1757,6 +1871,13 @@ def do_uninstall(install_dir, args=None):
     say("[5.5/6] 移除防火墙阻断规则 ...")
     if sys_ok:
         remove_firewall_block()
+    else:
+        say("  已跳过（隔离护栏）")
+
+    say("[5.6/6] 还原 IDM 更新包 ...")
+    if sys_ok:
+        _rok, _rmsg = restore_update_package()
+        say("  %s" % _rmsg)
     else:
         say("  已跳过（隔离护栏）")
 
