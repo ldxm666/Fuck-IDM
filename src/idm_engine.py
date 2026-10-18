@@ -30,6 +30,14 @@ IDM-Unlock.py —— Internet Download Manager 一键解锁（去试用/付费�
                             让 IDM 根本不认为自身 exe 损坏（唯一读者就是弹窗 gate）。
   P17 corrupt_alert_exit  : 兜底 —— 告警对话框的**唯一显示出口** `call` 改成 `mov eax,1`
                             （等价「用户点了继续下载」；**禁止补清栈**）。
+  P18 corrupt_nag_route_31: **【已 RETIRED·实测崩溃，不要启用】** OnTimer 字节表路由改道（id=0x31）。
+                            实测 P18/P19 × 3 = 崩 2；改道后 `KillTimer` 不再执行 ⇒ timer 一直响
+                            ⇒ 反复走 `0x4882A9` 的虚调用清理 ⇒ `0xC0000005`。
+  P19 corrupt_nag_route_26: **【已 RETIRED·同上】** 同族平行变体（id=0x26）。实现保留作否证记录。
+  P21 corrupt_nag_thread_b: **当前方案** —— 把 case 0x1517 里 `call _beginthreadex`（线程 0x484DB0）
+                            换成 `mov eax,1` ⇒ nag 线程不创建 ⇒ 弹窗不可能出现。
+  P22 corrupt_nag_thread_c: **当前方案** —— 同族变体 C（case 0x14BF，线程 0x47D520）。
+                            ⚠️ 变体 A（线程 0x483FB0，`0x49626B`）= **菜单功能，故意不覆盖**。
 
 用法示例
 --------
@@ -2221,7 +2229,345 @@ def find_corrupt_alert_exit(pe):
 
 
 # --------------------------------------------------------------------------- #
-# 统一入口：P1..P17 的构建与施加
+# P18 / P19 —— 「IDM is corrupt」**定时 nag 路由改道**（1 字节数据补丁）
+#
+# 完整链路（证据卡 `.scratch\fuckidm\rootfix2\ROOTFIX-474.md`，逐环唯一性验证）：
+#
+#   OnTimer(nIDEvent) 分派器  0x486BEB
+#     00486BEB  mov  eax,[ebp+0x6C]            ; nIDEvent
+#     00486BEE  dec  eax                        ; eax = nIDEvent-1
+#     00486BEF  cmp  eax,0x6E                   ; 仅 1..0x6F
+#     00486BF2  ja   0x4882A9                   ; 越界 ⇒ 默认无动作出口（早退尾声）
+#     00486BF8  movzx eax, byte [eax+0x488374]  ; ★ 字节索引表
+#     00486BFF  jmp  dword [eax*4+0x4882D0]     ; ★ 处理器跳表
+#        ├─ nIDEvent=0x31 ⇒ 表[0x30]=0x25(37) ⇒ jt[37]=0x487697
+#        │     0x487697 KillTimer(0x31) → PostMessageA(hwnd,0x111,0x1517,0) ★全库唯一
+#        │       ⇒ case 0x1517 ⇒ 0x4962EF ⇒ _beginthreadex(0x484DB0)
+#        │       ⇒ 解码 3 块 .data blob ⇒ GetDesktopWindow ⇒ MessageBoxW  ★真弹窗
+#        │       ⇒ SetTimer(id=0x31, 0x36EE80=1h) ⇒ 每小时复发
+#        └─ nIDEvent=0x26 ⇒ 表[0x25]=0x1B(27) ⇒ jt[27]=0x487602
+#              0x487602 KillTimer(0x26) → PostMessageA(hwnd,0x111,0x14BF,0) ★全库唯一
+#                ⇒ case 0x14BF ⇒ 0x49623D ⇒ 线程 0x47D520（平行变体，**同一文案**）
+#
+# ★ 补丁 = 把字节表里「该 nag」那一格改成 0x28(40)，而 jt[40] 正好是分派器
+#   自带 `ja 0x4882A9` 的越界默认出口 ⇒ 语义等价于「这个 timer id 没有处理器」。
+#   静态自检（2026-10-18 实测）：0x4882A9 = 标准 SEH 尾声 + `__security_check_cookie`
+#   + `ret 4`；其前一字节是 `c3`（无 fallthrough），全库唯一指向它的跳转就是那条 `ja`
+#   ⇒ 它是**专为「本 timer id 无处理器」准备的早退尾声**，不是会做别事的分支。
+# ★ 纯数据字节：无 call、无栈操作 ⇒ 铁律⑯ 无需任何清栈处理。
+# ★ 两个 finder 各自独立扫锚点（铁律⑪），不依赖 P16/P17 的施加状态。
+# ★ 必须 P18+P19 同时施加：两个变体**不共用点火点**，各弹各的。
+# --------------------------------------------------------------------------- #
+
+# OnTimer 分派器：`movzx eax, byte [eax+表基址32] ; jmp dword [eax*4+跳表基址32]`
+_ONTIMER_DISPATCHER = bytes.fromhex("0FB68074834800FF2485D0824800")
+# 两个 nag 变体的处理器块头（各含 `push imm8` 的 timer id；全库 uniq=1）
+_ONTIMER_HANDLER_31 = bytes.fromhex("6A318B462050FF158C576900")
+_ONTIMER_HANDLER_26 = bytes.fromhex("6A268B462050FF158C576900")
+# 改道目标：跳表里「越界默认出口」的下标（=40）。**不写死 VA**，由分派器自己的
+# `ja rel32` 目标与该下标的跳表项比对得出，见 `_find_ontimer_dispatcher()`。
+_ONTIMER_DEFAULT_INDEX = 0x28
+
+
+def _find_ontimer_dispatcher(pe, notes):
+    """定位 OnTimer 分派器，返回 `(disp_file_off, table_va, jt_va, default_va)`。
+
+    形状：`0f b6 80 <表基址32> ff 24 85 <跳表基址32>`（`movzx` + `jmp [eax*4+jt]`）。
+
+    自校验（三关，任一不过就拒绝施加）：
+      1. 锚点全库 uniq 必须 = 1；
+      2. 表基址 / 跳表基址必须都能映射回映像内；
+      3. 紧邻锚点**之前**必须有一条 `0f 87 rel32`（`ja`，越界出口），且其目标
+         **必须等于** `jt[0x28]` —— 这样「改道目标」是**数据推导**出来的，
+         不是我们写死的魔法 VA；同时 `(表基址−跳表基址)/4` 必须 = 0x29（41 项）。
+    """
+    d = bytes(pe.data)
+    t0, t1 = pe.text_span()
+    hits = []
+    p = d.find(_ONTIMER_DISPATCHER, t0)
+    while 0 <= p < t1:
+        hits.append(p)
+        p = d.find(_ONTIMER_DISPATCHER, p + 1)
+    if len(hits) != 1:
+        notes.append("[❌] mismatch：OnTimer 分派器锚点命中 %d 处（期望恰好 1）—— "
+                     "锚点未命中，拒绝施加（铁律⑫：不静默跳过）" % len(hits))
+        return None, None, None, None
+    disp = hits[0]
+    table_va = struct.unpack_from("<I", d, disp + 3)[0]
+    jt_va = struct.unpack_from("<I", d, disp + 10)[0]
+    table_off = pe.va_to_off(table_va)
+    jt_off = pe.va_to_off(jt_va)
+    if table_off is None or jt_off is None:
+        notes.append("[❌] mismatch：分派器里的表基址/跳表基址不在映像内 —— 拒绝施加")
+        return None, None, None, None
+    n_entries = (table_va - jt_va) // 4
+    if n_entries != _ONTIMER_DEFAULT_INDEX + 1:
+        notes.append("[❌] mismatch：跳表项数 %d ≠ %d（表/跳表基址几何变了）—— 拒绝施加"
+                     % (n_entries, _ONTIMER_DEFAULT_INDEX + 1))
+        return None, None, None, None
+    default_va = struct.unpack_from("<I", d, jt_off + _ONTIMER_DEFAULT_INDEX * 4)[0]
+    # 越界出口自校验：分派器前那条 `ja rel32` 的目标必须 == jt[0x28]
+    found_ja = False
+    for back in range(2, 10):
+        q = disp - back
+        if q < t0:
+            break
+        if d[q] == 0x0F and d[q + 1] == 0x87:
+            rel = struct.unpack_from("<i", d, q + 2)[0]
+            tgt = (pe.off_to_va(q) or 0) + 6 + rel
+            if tgt != default_va:
+                notes.append("[❌] mismatch：分派器越界出口 0x%08X ≠ jt[0x28] 0x%08X —— 拒绝施加"
+                             % (tgt, default_va))
+                return None, None, None, None
+            notes.append("分派器 VA 0x%08X：字节表 0x%08X（file 0x%X）/ 跳表 0x%08X（%d 项）/ "
+                         "越界默认出口 jt[0x28]=0x%08X（与 `ja` 目标一致 ✓）"
+                         % (pe.off_to_va(disp) or 0, table_va, table_off, jt_va,
+                            n_entries, default_va))
+            found_ja = True
+            break
+    if not found_ja:
+        notes.append("[❌] mismatch：分派器前未找到 `ja rel32` 越界出口 —— 拒绝施加")
+        return None, None, None, None
+    return disp, table_va, jt_va, default_va
+
+
+def _ontimer_route_site(pe, notes, handler_anchor, key_fmt, title, id_desc):
+    """P18/P19 共用：把某个 nIDEvent 的字节表项改道到「越界默认出口」。
+
+    定位链（**全部数据推导，不写死偏移**）：
+      1. 分派器锚点 ⇒ 字节表基址 / 跳表基址 / 越界默认出口（含三关自校验）；
+      2. 处理器块锚点 ⇒ 全库 uniq=1；锚点第 2 字节 = `push imm8` 的 timer id；
+      3. 在跳表里找**唯一**指向「该处理器块」的项 `j`（判据：`jt[j]` 指向的函数
+         前 32 字节内含该锚点）；
+      4. 自洽校验：`j + 1` 必须 == timer id（`dec eax` 后的下标语义）；
+      5. 表项位置 = 表基址 + (timer id − 1)；该位置当前值必须 == `j`（未施加）
+         或 == 0x28（已施加）；否则 mismatch 拒绝写。
+    """
+    d = bytes(pe.data)
+    t0, t1 = pe.text_span()
+    disp, table_va, jt_va, default_va = _find_ontimer_dispatcher(pe, notes)
+    if disp is None:
+        return None, notes
+    table_off = pe.va_to_off(table_va)
+    jt_off = pe.va_to_off(jt_va)
+
+    hh = []
+    p = d.find(handler_anchor, t0)
+    while 0 <= p < t1:
+        hh.append(p)
+        p = d.find(handler_anchor, p + 1)
+    if len(hh) != 1:
+        notes.append("[❌] mismatch：%s 处理器块锚点命中 %d 处（期望恰好 1）—— 拒绝施加"
+                     % (id_desc, len(hh)))
+        return None, notes
+    nev = d[hh[0] + 1]                       # `push imm8` 的 timer id
+
+    js = []
+    for j in range((table_va - jt_va) // 4):
+        v = struct.unpack_from("<I", d, jt_off + j * 4)[0]
+        vo = pe.va_to_off(v)
+        if vo is not None and handler_anchor in d[vo:vo + 32]:
+            js.append(j)
+    if len(js) != 1:
+        notes.append("[❌] mismatch：跳表里指向 %s 处理器块的项命中 %d 个（期望恰好 1）—— 拒绝施加"
+                     % (id_desc, len(js)))
+        return None, notes
+    j = js[0]
+    # ★ 正确的不变式：`dec eax` 之后 eax = timer id − 1 用作**字节表下标**，
+    #   而该格**存的字节**才是跳表下标 j（例如 id=0x31 ⇒ 表[0x30]=0x25=37 ⇒ jt[37]）。
+    #   ⇒ 这里只校验「表下标在表范围内」，`表[下标]==j` 的校验放在下面读表项时做。
+    table_index = nev - 1
+    if nev < 1 or table_off + table_index >= t1:
+        notes.append("[❌] mismatch：nIDEvent 0x%02X 的字节表下标 %d 越界 —— 拒绝施加"
+                     % (nev, table_index))
+        return None, notes
+    if j >= (table_va - jt_va) // 4:
+        notes.append("[❌] mismatch：跳表下标 %d 超出跳表范围 —— 拒绝施加" % j)
+        return None, notes
+    if j == _ONTIMER_DEFAULT_INDEX:
+        notes.append("[❌] 原值恰好等于改道目标 0x%02X，无法区分「未施加/已施加」—— 拒绝施加"
+                     % _ONTIMER_DEFAULT_INDEX)
+        return None, notes
+
+    off = table_off + table_index
+    cur = d[off]
+    applied = cur == _ONTIMER_DEFAULT_INDEX
+    if not applied and cur != j:
+        notes.append("[❌] mismatch：字节表 [0x%02X] 当前 0x%02X，既不是原值 0x%02X 也不是"
+                     "已施加值 0x%02X —— 拒绝施加" % (table_index, cur, j, _ONTIMER_DEFAULT_INDEX))
+        return None, notes
+    sites = [Site(
+        key_fmt % off, title, off, bytes([j]), bytes([_ONTIMER_DEFAULT_INDEX]),
+        va=pe.off_to_va(off),
+        detail="nIDEvent 0x%02X 的字节表项 [0x%02X]：0x%02X→0x%02X（跳表 idx %d → %d = "
+               "越界默认出口 0x%08X）；纯数据字节、无栈语义"
+               % (nev, table_index, j, _ONTIMER_DEFAULT_INDEX, j, _ONTIMER_DEFAULT_INDEX, default_va))]
+    notes.append("  [命中] VA 0x%08X：0x%02X -> 0x%02X（nIDEvent 0x%02X，表项 [0x%02X]，%s）"
+                 % (pe.off_to_va(off) or 0, j, _ONTIMER_DEFAULT_INDEX, nev, table_index,
+                    "已在位" if applied else "本次施加"))
+    return sites, notes
+
+
+def find_corrupt_nag_timer_route(pe):
+    """P18 —— corrupt 定时 nag 路由改道（id=0x31，主通道）。
+
+    `OnTimer(0x31)` 不再进入 `0x487697` ⇒ 永不 `PostMessageA(0x111,0x1517)` ⇒
+    线程 `0x484DB0` 不启动 ⇒ `MessageBoxW`（标题 `IDM is corrupt`）不产生。
+    清栈：纯数据字节，**无栈语义**。
+    """
+    return _ontimer_route_site(
+        pe, [], _ONTIMER_HANDLER_31, "corrupt_nag_route_31_%X",
+        "P18 corrupt 定时 nag 路由改道（id=0x31）", "nIDEvent 0x31")
+
+
+def find_corrupt_nag_timer_route2(pe):
+    """P19 —— corrupt 定时 nag 路由改道（id=0x26，平行变体）。
+
+    `OnTimer(0x26)` 不再进入 `0x487602` ⇒ 永不 `PostMessageA(0x111,0x14BF)` ⇒
+    线程 `0x47D520` 不启动。**dyn 实测该变体弹的是同一份 `IDM is corrupt` 文案**
+    ⇒ 必须与 P18 同时施加才覆盖全。
+    清栈：纯数据字节，**无栈语义**。
+    """
+    return _ontimer_route_site(
+        pe, [], _ONTIMER_HANDLER_26, "corrupt_nag_route_26_%X",
+        "P19 corrupt 定时 nag 路由改道（id=0x26）", "nIDEvent 0x26")
+
+
+# --------------------------------------------------------------------------- #
+# P21 / P22 —— corrupt nag **线程启动点**掐断（5 字节等长，WM_COMMAND case 内）
+#
+# ⚠️ 为什么放弃 P18/P19（idx 40 路由改道）—— 实测崩 2/3，机制已定性：
+#     正常 case 返回 → `0x4876C9 jmp 0x4882AE`（**纯尾声**）
+#     越界/未注册 id → `ja 0x4882A9`（纯尾声 + 额外一条 `call 0x61591a` 虚调用清理）
+#   `0x487697` 原本先 `KillTimer(hwnd,0x31)` 再 post；改道后 **KillTimer 不再执行**
+#   ⇒ timer 一直响 ⇒ 每次都走 `0x4882A9` 的虚调用清理 ⇒ 反复清理同一对象 ⇒ `0xC0000005`。
+#   ⇒ **idx 40 本身没问题（原版 68 个 id 在用），是我们把它变成了高频热路径。**
+#
+# 本轮改为掐**线程启动点**（最上游可达点），不碰定时器分派表、不碰任何数据结构、
+# 不改变任何 timer 的生命周期 ⇒ `_beginthreadex` 不被调用 ⇒ 线程不存在 ⇒ 弹窗不可能出现。
+#
+# 链路（三处 `_beginthreadex` 站点，全部在 `0x49A6BC` WM_COMMAND 跳表的不同 case 内）：
+#   变体 B  case 0x1517 → 0x4962EF: 5×`push 0` + `push 0x484DB0` + `call _beginthreadex`
+#           ⇒ 线程 0x484DB0：解码 3 块 .data blob → GetDesktopWindow → MessageBoxW
+#             （标题 `IDM is corrupt`，正文 342 字符）→ SetTimer(id=0x31, 1h)
+#   变体 C  case 0x14BF → 0x49623D: … `push 0x47D520` + `call _beginthreadex` ⇒ 线程 0x47D520
+#   变体 A  case ???    → 0x49625C: … `push 0x483FB0` + `call _beginthreadex`
+#           ⚠️ **变体 A = 菜单功能，绝对不要动**（动了会破坏菜单）。本模块**不提供** A 的 finder。
+#
+# ★ 清栈（铁律⑯）：**禁止补 `add esp`**。
+#   原代码在 `call` 之后**本就没有清栈**（紧跟 `mov eax,1`），6 个 `push` 的 24 字节由
+#   `jmp 0x49A515` 收尾段的 `add ebp,0x221c0 / mov esp,ebp / pop ebp / ret 8` **从 ebp 恢复**丢弃。
+#   `call` 自身的净栈变化为 0（压返回地址、`ret` 又弹回）⇒ 换成 `mov eax,1` 后 **esp 逐位相同**。
+# ★ 副作用：补丁点之后**原本就有一条 `mov eax,1`**（0x496303 / 0x496251），补丁后变成
+#   **两条连续的 `mov eax,1`** —— 冗余但**完全无害**（对同一寄存器写同一个常量，幂等）。
+# --------------------------------------------------------------------------- #
+
+# 三处线程启动锚点：5×`push 0` + `push <线程入口 imm32>`（各全库 uniq=1，**不含被改字节**）
+_NAG_THREAD_ANCHOR_B = bytes.fromhex("6A006A006A006A006A0068B04D4800")   # → 0x00484DB0
+_NAG_THREAD_ANCHOR_C = bytes.fromhex("6A006A006A006A006A006820D54700")   # → 0x0047D520
+# 本版原始字节（`call 0x61C55E` = `_beginthreadex`），仅用于 describe()/回滚说明；
+# 结构校验走「call 目标是否落在 .text 内」，避免锚点过严造成假阴性（铁律⑧）。
+_NAG_THREAD_OLD_B = bytes.fromhex("E85B621800")
+_NAG_THREAD_OLD_C = bytes.fromhex("E80D631800")
+_NAG_THREAD_NEW = b"\xb8\x01\x00\x00\x00"        # mov eax,1（与紧随的原指令同义）
+
+
+def _nag_thread_start_site(pe, notes, anchor, old_literal, key_fmt, title, variant):
+    """P21/P22 共用：把 `call _beginthreadex` 换成 `mov eax,1`（线程不创建）。
+
+    定位（锚点 + 三重结构校验，**不写死偏移**）：
+      1. 锚点 = 5×`push 0` + `push <线程入口 imm32>`，全库 **uniq 必须 = 1**；
+      2. 锚点**之后紧邻**就是 `call rel32`（`_beginthreadex`），其目标必须落在 `.text` 内；
+      3. 紧随 `call` 之后必须仍是 `b8 01 00 00 00`（原有 `mov eax,1`）、`9b`（`wait`）、
+         `e9`（`jmp rel32` → `0x49A515` 收尾段）—— 这三条**都不被本补丁改动**；
+      4. 已施加形态 = 补丁点 5 字节 == `b8 01 00 00 00`。
+    """
+    d = bytes(pe.data)
+    t0, t1 = pe.text_span()
+    hits = []
+    p = d.find(anchor, t0)
+    while 0 <= p < t1:
+        hits.append(p)
+        p = d.find(anchor, p + 1)
+    if len(hits) != 1:
+        notes.append("[❌] mismatch：%s 线程启动锚点命中 %d 处（期望恰好 1）—— "
+                     "锚点未命中，拒绝施加（铁律⑫：不静默跳过）" % (variant, len(hits)))
+        return None, notes
+    a = hits[0]
+    entry_va = struct.unpack_from("<I", d, a + len(anchor) - 4)[0]
+    if pe.va_to_off(entry_va) is None:
+        notes.append("[❌] mismatch：%s 锚点里的线程入口 0x%08X 不在映像内 —— 拒绝施加"
+                     % (variant, entry_va))
+        return None, notes
+    off = a + len(anchor)                    # 锚点之后紧邻就是 `call _beginthreadex`
+    cur = bytes(d[off:off + 5])
+    applied = cur == _NAG_THREAD_NEW
+    if applied:
+        old = old_literal
+    else:
+        if cur[0:1] != b"\xe8":
+            notes.append("[❌] mismatch：%s 锚点之后不是 `call rel32`（实际 %s）—— 拒绝施加"
+                         % (variant, cur.hex(" ")))
+            return None, notes
+        rel = struct.unpack_from("<i", d, off + 1)[0]
+        tgt_va = (pe.off_to_va(off) or 0) + 5 + rel
+        tgt_off = pe.va_to_off(tgt_va)
+        if tgt_off is None or not (t0 <= tgt_off < t1):
+            notes.append("[❌] mismatch：%s 的 call 目标 0x%08X 不在 .text 内 —— 拒绝施加"
+                         % (variant, tgt_va))
+            return None, notes
+        notes.append("%s 线程入口 0x%08X / `call` 目标 0x%08X（`_beginthreadex`）"
+                     % (variant, entry_va, tgt_va))
+        if cur != old_literal:
+            notes.append("  （call rel32 与本版记录不同：%s vs %s，按结构校验继续）"
+                         % (cur.hex(" "), old_literal.hex(" ")))
+        old = cur
+    # 三重结构校验（均不被本补丁改动）
+    if bytes(d[off + 5:off + 10]) != b"\xb8\x01\x00\x00\x00":
+        notes.append("[❌] mismatch：%s 的 `call` 之后不是原有的 `mov eax,1`（实际 %s）—— 拒绝施加"
+                     % (variant, d[off + 5:off + 10].hex(" ")))
+        return None, notes
+    if d[off + 10] != 0x9B or d[off + 11] != 0xE9:
+        notes.append("[❌] mismatch：%s 的 `mov eax,1` 之后不是 `wait; jmp rel32`（实际 %s）—— 拒绝施加"
+                     % (variant, d[off + 10:off + 14].hex(" ")))
+        return None, notes
+    sites = [Site(
+        key_fmt % off, title, off, old, _NAG_THREAD_NEW, va=pe.off_to_va(off),
+        detail="`call _beginthreadex` -> `mov eax,1`（线程 %X 不创建；"
+               "`call` 净栈变化 0 ⇒ esp 逐位相同，**禁止补 add esp**；"
+               "补丁后与原有 `mov eax,1` 形成两条连续同义指令，冗余但无害）" % entry_va)]
+    notes.append("  [命中] VA 0x%08X：%s -> %s（%s）"
+                 % (pe.off_to_va(off) or 0, old.hex(" "), _NAG_THREAD_NEW.hex(" "),
+                    "已在位" if applied else "本次施加"))
+    return sites, notes
+
+
+def find_corrupt_nag_thread_start(pe):
+    """P21 —— corrupt nag 线程启动点掐断（变体 B，线程 `0x484DB0`，case 0x1517）。
+
+    `_beginthreadex(0x484DB0)` 不被调用 ⇒ 该线程不存在 ⇒ 它内部的
+    `GetDesktopWindow` + `MessageBoxW`（标题 `IDM is corrupt`）不可能发生。
+    清栈：**禁止补 `add esp`**（详见本节头部论证）。
+    """
+    return _nag_thread_start_site(
+        pe, [], _NAG_THREAD_ANCHOR_B, _NAG_THREAD_OLD_B, "corrupt_nag_thread_b_%X",
+        "P21 corrupt nag 线程启动点掐断（变体B / 线程 0x484DB0）", "变体 B")
+
+
+def find_corrupt_nag_thread_start2(pe):
+    """P22 —— corrupt nag 线程启动点掐断（变体 C，线程 `0x47D520`，case 0x14BF）。
+
+    ⚠️ **变体 A（线程 `0x483FB0`，`0x49626B`）是菜单功能，本模块不提供其 finder**，
+    也不得由任何其它 finder 命中它（三处锚点的 imm32 各不相同，各 uniq=1）。
+    清栈：**禁止补 `add esp`**。
+    """
+    return _nag_thread_start_site(
+        pe, [], _NAG_THREAD_ANCHOR_C, _NAG_THREAD_OLD_C, "corrupt_nag_thread_c_%X",
+        "P22 corrupt nag 线程启动点掐断（变体C / 线程 0x47D520）", "变体 C")
+
+
+# --------------------------------------------------------------------------- #
+# 统一入口：P1..P22 的构建与施加
 #
 # 放在 engine 里（而不是 activator 里）是为了让「部署/验证」与「用户流程」两条
 # 工作流共用同一份实现，避免两处各写一套 apply 逻辑而漂移。
@@ -2247,6 +2593,19 @@ ALL_FINDERS = (
     # 的施加后状态，也不与任何既有站点共用偏移。
     (find_corrupt_flag_gate, "P16 corrupt 判定标志不置位（根治）"),
     (find_corrupt_alert_exit, "P17 corrupt 告警显示出口短路（兜底）"),
+    # ⚠️ P18/P19（OnTimer 字节表路由改道 → idx 40）**已实测崩溃，定案放弃**：
+    #   实测 P18/P19 × 3 = 崩 2 / 活 1（1.36s / 4.52s，0xC0000005 偏移 0）；同期 P17 × 10 全净。
+    #   机制：`0x487697` 原本先 KillTimer(0x31) 再 post；改道后 KillTimer 不再执行 ⇒ timer 一直响
+    #   ⇒ 每次都走 `0x4882A9`（比纯尾声 `0x4882AE` 多一条 `call 0x61591a` 虚调用清理）
+    #   ⇒ 反复清理同一对象 ⇒ 访问违例。**idx 40 本身没问题，是我们把它变成了高频热路径。**
+    #   ⇒ **不进 ALL_FINDERS**；仅保留实现作为「被否证方案」的记录，避免后人误以为它有效。
+    #   **不要重新启用。** 改用下面的 P21/P22（掐线程启动点）。
+    # (find_corrupt_nag_timer_route,  "P18 corrupt 定时 nag 路由改道（id=0x31）【RETIRED·实测崩溃】"),
+    # (find_corrupt_nag_timer_route2, "P19 corrupt 定时 nag 路由改道（id=0x26）【RETIRED·实测崩溃】"),
+    # P21/P22 掐 `_beginthreadex` 线程启动点：不碰定时器分派表、不改任何 timer 生命周期，
+    # 两个 finder 各自独立扫锚点（铁律⑪），且**不覆盖变体 A（菜单功能）**。
+    (find_corrupt_nag_thread_start, "P21 corrupt nag 线程启动点掐断（变体B / 线程 0x484DB0）"),
+    (find_corrupt_nag_thread_start2, "P22 corrupt nag 线程启动点掐断（变体C / 线程 0x47D520）"),
     # ⚠️ P12（find_license_valid，file 0xEDBF7 / 0xEDC1F，A+B）**已被实测否决**：
     #    Lead 手工热补丁 + 冷启动验证 ⇒ 注册框照旧弹 12/12。原因是它改的
     #    `byte_788CF4` 根本不是「决定弹注册框」的标志（注册框的门控在

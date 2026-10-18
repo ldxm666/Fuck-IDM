@@ -3,6 +3,64 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.3] - 2026-10-18
+
+**`IDM is corrupt` 定时 nag 真正消失**：新增 **P21 / P22**，掐断两条 nag 的
+`_beginthreadex` 线程启动点（线程不创建 ⇒ 弹窗不可能出现）。
+启动存活 **10/10、0 崩溃**（WER 新增 0）。
+
+### 背景：v1.0.2 的 P16/P17 管不到这条链
+
+v1.0.2 的 P16/P17 封的是 `sub_4A8CA0` → `DialogBoxIndirectParamW` 那条**对话框**链
+（标题 `Internet Download Manager`、双按钮）。用户实测**仍在弹**，重新定位到**另一条独立链**：
+
+```
+OnTimer(nIDEvent) 0x486BEB → 字节表 0x488374[(id−1)] → 跳表 0x4882D0[idx]
+  ├─ id=0x31 → 0x487697：KillTimer → PostMessageA(0x111,0x1517)   ★全库唯一
+  └─ id=0x26 → 0x487602：KillTimer → PostMessageA(0x111,0x14BF)   ★全库唯一
+        → case handler → `_beginthreadex`（线程 0x484DB0 / 0x47D520）
+        → 解码 3 块 .data 编码 blob（`b[i]=(b[i]+min(i,255))^7`）
+        → GetDesktopWindow → MessageBoxW（标题 `IDM is corrupt`，正文 342 字符）
+        → SetTimer(id, 0x36EE80 = 1 小时)   ⇒ **每小时复发**
+```
+
+⇒ 这就解释了「用一段时间后突然弹」：**1 小时周期 nag**，不是启动自检。
+
+### 新增
+
+- **P21 `find_corrupt_nag_thread_start()`**（VA `0x4962FE` / file `0x956FE`）：
+  `E8 5B 62 18 00` → `B8 01 00 00 00`。变体 B（线程 `0x484DB0`，case `0x1517`）不创建。
+- **P22 `find_corrupt_nag_thread_start2()`**（VA `0x49624C` / file `0x9564C`）：
+  `E8 0D 63 18 00` → `B8 01 00 00 00`。变体 C（线程 `0x47D520`，case `0x14BF`）。
+  dyn 实测该变体弹的**也是同一份文案** ⇒ 必须与 P21 同时施加。
+- **清栈**：**禁止补 `add esp`**。原代码 `call` 后本无清栈；6 个 `push` 的 24 字节由
+  `jmp 0x49A515` 收尾段的 `add ebp,0x221c0 / mov esp,ebp` 从 ebp 恢复丢弃；
+  `call` 净栈变化 0 ⇒ 换 `mov eax,1` 后 **esp 逐位相同**。
+- **红线**：变体 A（线程 `0x483FB0`，`0x49626B`）= **菜单功能，故意不覆盖**。
+
+### 变更
+
+- 补丁点总数：**26 → 28**（原始 b15 上 `build_all_sites` 口径）；
+  已打全量镜像上 22 → **24**；`--scan` 可施加点 22 → **24**。
+- 新全量基线：**`C3248B693BA8F4AEBD10EAEDA2F4691206CBEB3F1A772F44836EB5A860B4C858`**
+  （6,201,712 B，大小不变）
+
+### ❌ 已否决（记录，不要启用）
+
+- **P18/P19**（`OnTimer` 字节表路由改道到 `jt[40]=0x4882A9`）：
+  `P17 × 10` = 10 存活 / 0 崩，但 **`P18/P19 × 3` = 崩 2 / 活 1**（1.36s / 4.52s，`0xC0000005`）。
+  机制（**静态推演，未 hook 实证**）：改道后 `KillTimer` 不再执行 ⇒ timer 一直响 ⇒ 每次都走
+  `0x4882A9`（比纯尾声 `0x4882AE` 多一条 `call 0x61591a` 虚调用清理）⇒ 反复清理同一对象。
+  **已从 `ALL_FINDERS` 摘除**，实现保留作否证记录。
+- **idx 8 备选方案**（`jt[8]=0x4882AE`）：idx 8 原主 `nIDEvent 0x10` 在原版**从未被 armed**
+  （70 个 `SetTimer` 站点里 0 处）⇒ 死代码，改过去等于首次启用，风险更大。同样否决。
+
+### 诚实边界
+
+已排除范围内**未发现完整性校验**（37+4 个 `sub_474EB0`/`sub_46DB20` 调用者、`0x484DB0` 全函数、
+`0x486BB8–0x4882CC` 分派器、`0x49A6BC` 全 110 项跳表）；nag 是**硬编码周期消息**。
+⇒ 「让判定不成立」**不可达**（IDM 不做该判断）；本方案为**让 nag 动作永不发生**，是**最上游可达点**。
+
 ## [1.0.2] - 2026-10-18
 
 **修复 `IDM is corrupt` 弹窗（根治，不再靠拦截器治标）**

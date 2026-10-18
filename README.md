@@ -67,7 +67,8 @@ IDM-Activator.exe --uninstall
 
 **解锁后 IDM 打不开？** 用 `--uninstall` 回滚，或复制 `IDMan.exe.bak-original` 回去。
 
-**还弹 `IDM is corrupt`？** v1.0.2 起已根治。若仍弹，用 `--status` 确认 P16 / P17 是「已到位」。
+**还弹 `IDM is corrupt`？** v1.0.3 起已根治（包括用一段时间后每隔约 1 小时复发的那种）。
+若仍弹，用 `--status` 确认补丁点全部「已到位」。
 
 ## 免责声明
 
